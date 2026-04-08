@@ -1,0 +1,47 @@
+# sticky configuration
+# Copy this file to your config directory and rename to config.toml:
+#   Linux/macOS: ~/.config/sticky/config.toml
+#   Windows:     %APPDATA%\sticky\config.toml
+#
+# All values below show the defaults. Uncomment and change as needed.
+# Environment variables (STICKY_ prefix) take precedence over this file.
+
+# --- LLM ---
+# Get your key at https://openrouter.ai/keys
+# openrouter_api_key = "sk-or-v1-your-key-here"
+openrouter_model = "anthropic/claude-sonnet-4.6"
+
+# --- Embeddings ---
+# Local sentence-transformer model (runs on your machine, no API calls)
+embedding_model = "all-MiniLM-L6-v2"
+embedding_dimensions = 384
+
+# --- Search ---
+# Hybrid search weights (must sum to 1.0)
+search_vector_weight = 0.6
+search_fts_weight = 0.4
+search_mode = "hybrid"          # hybrid | vector | fts
+default_search_limit = 10
+
+# --- Classification ---
+# Thoughts below this confidence are flagged for manual review
+confidence_threshold = 0.6
+
+# --- Digest ---
+digest_default_period = "day"   # day | week | month
+
+# --- Review ---
+# Auto-accept low-confidence thoughts after N days (0 = never)
+review_auto_resolve_days = 7
+
+# --- TUI ---
+tui_default_view = "auto"       # auto | home | digest
+tui_show_filter_bar = false
+# tui_score_hint_shown = false  # set automatically after first search
+
+# --- Privacy ---
+privacy_show_in_status = true   # show "Embed: local | LLM: cloud" in status bar
+
+# --- Data ---
+# default_list_limit = 20
+# data_dir = "~/.local/share/sticky"  # or %LOCALAPPDATA%\sticky on Windows

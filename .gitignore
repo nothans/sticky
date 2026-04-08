@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# uv
+uv.lock
+
+# sticky data (local user data — never commit)
+config.toml
+sticky.db
+*.db-wal
+*.db-shm
+
+# Claude Code (local agent config)
+.claude/
+
+# Internal design artifacts
+.meta/
+
+# Export artifacts
+sticky_export.json
+sticky_export/
+
+# Sensitive
+.env
+.env.*
+*.key
+.mcp.json
+docs/
