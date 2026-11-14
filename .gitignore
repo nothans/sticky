@@ -37,9 +37,6 @@ sticky.db
 # Claude Code (local agent config)
 .claude/
 
-# Internal design artifacts
-.meta/
-
 # Export artifacts
 sticky_export.json
 sticky_export/
