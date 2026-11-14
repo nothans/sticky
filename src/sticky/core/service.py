@@ -1,30 +1,28 @@
 """Service orchestration layer for sticky.
 
 ALL interfaces (MCP, CLI, TUI) call StickyService methods.
-Coordinates the full pipeline: embedding, classification, entity
-resolution, search, digest, import/export.
+Capture, editing, and search are local. Cloud digests are explicit and optional.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import platform
+import os
 import re
+import sqlite3
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from sticky.core.classify import Classifier
 from sticky.core.config import StickyConfig, get_config
-from sticky.core.db import Database
+from sticky.core.db import Database, _timestamp_key, encode_cursor
 from sticky.core.digest import DigestGenerator
 from sticky.core.embeddings import EmbeddingEngine
-from sticky.core.entities import EntityResolver
 from sticky.core.models import (
-    ActionItem,
-    ClassificationResult,
     Digest,
     Thought,
 )
@@ -46,221 +44,76 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len].rstrip("-")
 
 
+def _markdown_filename(thought: Thought) -> str:
+    try:
+        date = datetime.fromisoformat(thought.created_at).strftime("%Y-%m-%d")
+    except ValueError:
+        date = "unknown"
+    return f"{date}_{quote(thought.id, safe='')}_{_slugify(thought.content)}.md"
+
+
 class StickyService:
     """Central orchestration service for sticky.
 
-    Coordinates embedding, classification, entity resolution, search,
-    digest generation, and data import/export.
+    Coordinates local notes/search, optional digests, and data import/export.
     """
 
-    def __init__(
-        self,
-        data_dir: Path | str | None = None,
-        config: StickyConfig | None = None,
-    ) -> None:
-        if config is not None:
-            self.config = config
-        else:
-            self.config = get_config(force_reload=True)
-
+    def __init__(self, data_dir: Path | str | None = None, config: StickyConfig | None = None) -> None:
+        self.config = config if config is not None else get_config(force_reload=True)
         if data_dir is not None:
             self.config.data_dir = Path(data_dir)
-
         self.db = Database(self.config.db_path)
-        self.embedding_engine = EmbeddingEngine(self.config.embedding_model)
-        self.classifier = Classifier(
-            api_key=self.config.openrouter_api_key,
-            model=self.config.openrouter_model,
-        )
-        self.entity_resolver = EntityResolver(self.db)
+        self.embedding_engine = EmbeddingEngine()
         self.digest_generator = DigestGenerator(
-            api_key=self.config.openrouter_api_key,
-            model=self.config.openrouter_model,
+            api_key=self.config.openrouter_api_key, model=self.config.openrouter_model,
         )
         self.search_engine: HybridSearch | None = None
 
     def initialize(self) -> None:
-        """Initialize database, directories, and search engine.
-
-        Also auto-resolves review items older than review_auto_resolve_days.
-        """
+        """Initialize local storage and search; no cloud or review work on startup."""
         self.config.ensure_dirs()
         self.db.initialize()
-        self.search_engine = HybridSearch(
-            db=self.db,
-            engine=self.embedding_engine,
-            vector_weight=self.config.search_vector_weight,
-            fts_weight=self.config.search_fts_weight,
-        )
+        self.search_engine = HybridSearch(db=self.db, engine=self.embedding_engine)
 
-        # Auto-resolve old review items
+    def _embed(self, content: str) -> bytes | None:
+        """Best-effort local enrichment, shared by capture, edit, and restore."""
         try:
-            self.db.execute(
-                """UPDATE thoughts SET needs_review = 0
-                   WHERE needs_review = 1
-                   AND updated_at < datetime('now', '-' || ? || ' days')""",
-                (str(self.config.review_auto_resolve_days),),
-            )
-            self.db._get_conn().commit()
+            embedding = self.embedding_engine.embed(content)
+            if not isinstance(embedding, bytes) or len(embedding) != 384 * 4:
+                raise ValueError("The supported model must produce 384 float32 values")
+            return embedding
         except Exception as exc:
-            logger.warning("Failed to auto-resolve review items: %s", exc)
+            logger.warning("Embedding unavailable; keeping raw note: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Core operations
     # ------------------------------------------------------------------
 
     def capture(
-        self,
-        content: str,
-        template: str | None = None,
-        source: str = "cli",
-        source_url: str | None = None,
-        thread: str | None = None,
+        self, content: str, template: str | None = None, source: str = "cli",
+        source_url: str | None = None, thread: str | None = None,
     ) -> dict:
-        """Capture a new thought.
-
-        1. Generate embedding (sync, local)
-        2. Classify via LLM (graceful degradation)
-        3. Resolve entities
-        4. Store thought
-        5. Extract and store action items
-
-        Capture NEVER fails -- if classification fails, defaults are used.
-
-        Returns:
-            Dict with id, content, category, confidence, needs_review,
-            entities, created_at.
-        """
-        # 1. Generate embedding
-        try:
-            embedding = self.embedding_engine.embed(content)
-        except Exception as exc:
-            logger.warning("Embedding failed: %s", exc)
-            embedding = None
-
-        # 1b. Dedup check — reject near-identical content (cosine > 0.95)
-        if embedding is not None:
-            if self.db.has_vec:
-                dup_rows = self.db.execute(
-                    """SELECT thought_id, distance FROM vec_thoughts
-                       WHERE embedding MATCH ? AND k = 1
-                       ORDER BY distance""",
-                    (embedding,),
-                ).fetchall()
-                if dup_rows and (1.0 - dup_rows[0]["distance"]) > 0.95:
-                    existing_id = dup_rows[0]["thought_id"]
-                    existing = self.db.get_thought(existing_id)
-                    if existing:
-                        sim = round(1.0 - dup_rows[0]["distance"], 3)
-                        logger.info("Duplicate detected (sim=%.3f): %s", sim, existing_id)
-                        return {
-                            "id": existing_id,
-                            "content": existing.content,
-                            "duplicate": True,
-                            "similarity": sim,
-                            "message": "Near-duplicate thought already exists.",
-                        }
-            else:
-                rows = self.db.execute(
-                    "SELECT id, content, embedding FROM thoughts WHERE embedding IS NOT NULL"
-                ).fetchall()
-                for row in rows:
-                    sim = self.embedding_engine.cosine_similarity(embedding, row["embedding"])
-                    if sim > 0.95:
-                        logger.info("Duplicate detected (sim=%.3f): %s", sim, row["id"])
-                        return {
-                            "id": row["id"],
-                            "content": row["content"],
-                            "duplicate": True,
-                            "similarity": round(sim, 3),
-                            "message": "Near-duplicate thought already exists.",
-                        }
-
-        # 2. Classify via LLM (graceful degradation)
-        classification: ClassificationResult | None = None
-        try:
-            classification = self.classifier.classify_sync(content, template)
-        except Exception as exc:
-            logger.warning("Classification failed: %s", exc)
-
-        # Determine category, confidence, needs_review
-        if classification is not None:
-            category = classification.category
-            confidence = classification.confidence
-            needs_review = confidence < self.config.confidence_threshold
-        else:
-            category = None
-            confidence = 0.0
-            needs_review = True
-
-        # Use classifier-detected URL if none provided explicitly
-        if source_url is None and classification is not None and getattr(classification, 'source_url', None):
-            source_url = classification.source_url
-
-        # 3. Create and store thought
+        """Save each capture locally. Embedding failure leaves a searchable raw note."""
+        if not content.strip():
+            raise ValueError("A thought must contain text")
+        embedding = self._embed(content)
         thought = Thought.create(
-            content=content,
-            embedding=embedding,
-            embedding_model=self.config.embedding_model if embedding is not None else None,
-            source_url=source_url,
-            category=category,
-            confidence=confidence,
-            needs_review=needs_review,
-            source=source,
+            content=content, embedding=embedding,
+            embedding_model=self.embedding_engine.model_name if embedding is not None else None,
+            source_url=source_url, source=source,
         )
         if template:
             thought.metadata["template"] = template
         if thread:
             thought.metadata["thread"] = thread
         self.db.insert_thought(thought)
-
-        # 4. Resolve entities
-        entities: list[dict] = []
-        if classification is not None:
-            try:
-                entities = self.entity_resolver.resolve_entities(
-                    classification, thought.id
-                )
-            except Exception as exc:
-                logger.warning("Entity resolution failed: %s", exc)
-
-        # 5. Extract and store action items (max 2 per thought)
-        if classification is not None and classification.actions:
-            people_lower = {p.lower(): p for p in (classification.people or [])}
-            for action_text in classification.actions[:2]:
-                try:
-                    # Match person by name appearing in the action text
-                    person = None
-                    action_lower = action_text.lower()
-                    for name_lower, name in people_lower.items():
-                        if name_lower in action_lower:
-                            person = name
-                            break
-                    action_item = ActionItem(
-                        content=action_text,
-                        person=person,
-                        source_thought_id=thought.id,
-                    )
-                    self.db.insert_action_item(action_item)
-                except Exception as exc:
-                    logger.warning("Failed to store action item: %s", exc)
-
-        return {
-            "id": thought.id,
-            "content": thought.content,
-            "category": category,
-            "confidence": confidence,
-            "needs_review": needs_review,
-            "entities": entities,
-            "source_url": thought.source_url,
-            "created_at": thought.created_at,
-            "thread": thought.metadata.get("thread"),
-        }
+        return {**thought.to_display(), "thread": thought.metadata.get("thread")}
 
     def search(
         self,
         query: str,
-        limit: int = 10,
+        limit: int | None = None,
         mode: str = "hybrid",
         **filters: Any,
     ) -> list[dict]:
@@ -270,6 +123,9 @@ class StickyService:
         """
         if self.search_engine is None:
             raise RuntimeError("Service not initialized. Call initialize() first.")
+        limit = self.config.default_search_limit if limit is None else limit
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
 
         start = time.monotonic()
         results = self.search_engine.search(
@@ -294,60 +150,26 @@ class StickyService:
         ]
 
     def list_thoughts(self, **kwargs: Any) -> dict:
-        """Paginated listing of thoughts.
-
-        Returns dict with thoughts, total, has_more, next_cursor.
-        """
-        limit = kwargs.get("limit", self.config.default_list_limit)
-        cursor = kwargs.get("cursor")
-        category = kwargs.get("category")
-        entity = kwargs.get("entity")
-        after = kwargs.get("after")
-        before = kwargs.get("before")
-        needs_review = kwargs.get("needs_review")
-        sort = kwargs.get("sort", "created_at_desc")
-        thread = kwargs.get("thread")
-
-        thoughts, total = self.db.list_thoughts(
-            limit=limit,
-            cursor=cursor,
-            category=category,
-            entity=entity,
-            after=after,
-            before=before,
-            needs_review=needs_review,
-            sort=sort,
-            thread=thread,
-        )
-
-        thought_dicts = [t.to_display() for t in thoughts]
-        has_more = len(thoughts) == limit and len(thoughts) < total
-
-        result: dict[str, Any] = {
-            "thoughts": thought_dicts,
-            "total": total,
-            "has_more": has_more,
-        }
-
+        """List notes with a stable cursor and an exact next-page indication."""
+        limit = kwargs.pop("limit", None)
+        limit = self.config.default_list_limit if limit is None else limit
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        thoughts, total = self.db.list_thoughts(limit=limit + 1, **kwargs)
+        has_more = len(thoughts) > limit
+        thoughts = thoughts[:limit]
+        result = {"thoughts": [t.to_display() for t in thoughts], "total": total, "has_more": has_more}
         if thoughts and has_more:
-            result["next_cursor"] = thoughts[-1].created_at
-
+            result["next_cursor"] = encode_cursor(thoughts[-1], kwargs.get("sort", "created_at_desc"))
         return result
 
-    def get_review_items(self, limit: int = 10) -> dict:
-        """Get thoughts needing review.
+    def get_thought(self, thought_id: str) -> dict:
+        """Read a complete note by its ID."""
+        thought = self.db.get_thought(thought_id)
+        if thought is None:
+            raise ValueError(f"Thought {thought_id} not found")
+        return thought.to_display()
 
-        Returns dict with items and total count.
-        """
-        thoughts, total = self.db.list_thoughts(
-            limit=limit,
-            needs_review=True,
-        )
-
-        return {
-            "items": [t.to_display() for t in thoughts],
-            "total": total,
-        }
 
     def classify_thought(self, thought_id: str, category: str) -> dict:
         """Manually reclassify a thought.
@@ -360,6 +182,8 @@ class StickyService:
         thought = self.db.get_thought(thought_id)
         if thought is None:
             raise ValueError(f"Thought {thought_id} not found")
+        if not category.strip():
+            raise ValueError("A category must contain text")
 
         self.db.update_thought(
             thought_id,
@@ -371,213 +195,40 @@ class StickyService:
         updated = self.db.get_thought(thought_id)
         return updated.to_display()
 
-    def list_entities(self, **kwargs: Any) -> dict:
-        """List entities with recent_thoughts per entity.
 
-        Returns dict with entities and total count.
-        """
-        entity_type = kwargs.get("entity_type")
-        query = kwargs.get("query")
-        limit = kwargs.get("limit", self.config.default_list_limit)
-        sort = kwargs.get("sort", "last_seen")
-
-        entities, total = self.db.list_entities(
-            entity_type=entity_type,
-            query=query,
-            limit=limit,
-            sort=sort,
-        )
-
-        entity_dicts = []
-        for entity in entities:
-            ed = entity.model_dump()
-            # Get recent thoughts for this entity
-            recent = self.db.get_thoughts_for_entity(entity.id, limit=3)
-            ed["recent_thoughts"] = [t.to_display() for t in recent]
-            entity_dicts.append(ed)
-
-        return {
-            "entities": entity_dicts,
-            "total": total,
-        }
-
-    def digest(
-        self,
-        period: str = "day",
-        since: str | None = None,
-    ) -> dict:
-        """Generate a digest for the given period.
-
-        Collects thoughts, finds resurface candidates, carries forward
-        uncompleted action items, stores digest, and returns structured result.
-
-        Returns:
-            Dict with digest, period, thought_count, action_items,
-            people_mentioned, resurfaced, digest_id, source_map.
-        """
-        # Determine time range
+    def digest(self, period: str = "day", since: str | None = None) -> dict:
+        """Generate an optional digest only on explicit request with a configured key."""
+        if not self.config.openrouter_api_key.strip():
+            raise ValueError("A configured OpenRouter API key is required for a cloud digest")
+        deltas = {"day": timedelta(days=1), "week": timedelta(weeks=1), "month": timedelta(days=30)}
+        if period not in deltas:
+            raise ValueError("period must be day, week, or month")
         now = datetime.now(timezone.utc)
+        start = since if since is not None else (now - deltas[period]).isoformat()
         if since is not None:
-            period_start = since
-        else:
-            period_deltas = {
-                "day": timedelta(days=1),
-                "week": timedelta(weeks=1),
-                "month": timedelta(days=30),
-            }
-            delta = period_deltas.get(period, timedelta(days=1))
-            period_start = (now - delta).isoformat()
-
-        period_end = now.isoformat()
-
-        # Get thoughts for the period
-        thoughts, _ = self.db.list_thoughts(
-            after=period_start,
-            limit=1000,
-            sort="created_at_asc",
-        )
-
-        # Find resurface candidate using DigestGenerator helper
-        resurfaced_thought: Thought | None = None
-        resurfaced_dict: dict | None = None
-        if thoughts:
-            try:
-                resurfaced_thought = self.digest_generator.find_resurface_candidate(
-                    db=self.db,
-                    engine=self.embedding_engine,
-                    recent_thoughts=thoughts,
-                    min_age_days=7,
-                )
-                if resurfaced_thought is not None:
-                    resurfaced_dict = resurfaced_thought.to_display()
-            except Exception as exc:
-                logger.warning("Resurface candidate search failed: %s", exc)
-
-        # Carry forward uncompleted, non-expired action items
-        active_actions = self.db.list_action_items(completed=False, limit=50)
-        action_dicts = []
-        for action in active_actions:
-            # Check if expired
-            try:
-                expires = datetime.fromisoformat(action.expires_at)
-                if expires > now:
-                    action_dicts.append({
-                        "id": action.id,
-                        "content": action.content,
-                        "person": action.person,
-                        "created_at": action.created_at,
-                        "expires_at": action.expires_at,
-                    })
-            except (ValueError, TypeError):
-                action_dicts.append({
-                    "id": action.id,
-                    "content": action.content,
-                    "person": action.person,
-                    "created_at": action.created_at,
-                    "expires_at": action.expires_at,
-                })
-
-        # Collect people mentioned
-        people_mentioned: list[str] = []
-        for t in thoughts:
-            rows = self.db.execute(
-                """SELECT DISTINCT e.name FROM entities e
-                   JOIN entity_mentions em ON em.entity_id = e.id
-                   WHERE em.thought_id = ? AND e.entity_type = 'person'""",
-                (t.id,),
-            ).fetchall()
-            for row in rows:
-                name = row["name"]
-                if name not in people_mentioned:
-                    people_mentioned.append(name)
-
-        # Generate digest content via DigestGenerator
-        digest_result = self.digest_generator.generate_sync(
-            thoughts=thoughts,
-            resurfaced=resurfaced_thought,
-        )
-
-        # digest_result has keys: text, source_map, action_items, people
-        digest_content = digest_result.get("text", "")
-        source_map = digest_result.get("source_map", {})
-
-        if not digest_content:
-            digest_content = f"No thoughts found for {period} period."
-
-        # Store digest
-        thought_ids = [t.id for t in thoughts]
-        digest_model = Digest(
-            content=digest_content,
-            thought_ids=thought_ids,
-            period_start=period_start,
-            period_end=period_end,
-        )
-        self.db.insert_digest(digest_model)
-
-        return {
-            "digest": digest_content,
-            "period": period,
-            "thought_count": len(thoughts),
-            "action_items": action_dicts,
-            "people_mentioned": people_mentioned,
-            "resurfaced": resurfaced_dict,
-            "digest_id": digest_model.id,
-            "source_map": source_map,
-        }
+            datetime.fromisoformat(since)
+        thoughts, _ = self.db.list_thoughts(after=start, before=now.isoformat(), limit=1001, sort="created_at_asc")
+        if len(thoughts) > 1000:
+            raise ValueError("Digest period exceeds 1000 notes; choose a shorter period or a later since date")
+        result = self.digest_generator.generate_sync(thoughts)
+        digest = Digest(content=result["text"], thought_ids=[t.id for t in thoughts], period_start=start, period_end=now.isoformat())
+        self.db.insert_digest(digest)
+        return {"digest": digest.content, "period": period, "thought_count": len(thoughts), "digest_id": digest.id, "thought_ids": digest.thought_ids}
 
     def update(self, thought_id: str, content: str) -> dict:
-        """Update a thought: re-embed, re-classify, re-resolve entities.
-
-        Raises:
-            ValueError: If thought_id not found.
-        """
+        """Edit locally, replacing or clearing the old search representation."""
         thought = self.db.get_thought(thought_id)
         if thought is None:
             raise ValueError(f"Thought {thought_id} not found")
-
-        # Re-embed
-        try:
-            embedding = self.embedding_engine.embed(content)
-        except Exception as exc:
-            logger.warning("Re-embedding failed: %s", exc)
-            embedding = thought.embedding
-
-        # Re-classify
-        classification: ClassificationResult | None = None
-        try:
-            classification = self.classifier.classify_sync(content)
-        except Exception as exc:
-            logger.warning("Re-classification failed: %s", exc)
-
-        if classification is not None:
-            category = classification.category
-            confidence = classification.confidence
-            needs_review = confidence < self.config.confidence_threshold
-        else:
-            category = thought.category
-            confidence = thought.confidence
-            needs_review = thought.needs_review
-
-        # Update in DB
+        if not content.strip():
+            raise ValueError("A thought must contain text")
+        embedding = self._embed(content)
         self.db.update_thought(
-            thought_id,
-            content=content,
-            embedding=embedding,
-            category=category,
-            confidence=confidence,
-            needs_review=needs_review,
+            thought_id, content=content, embedding=embedding,
+            embedding_model=self.embedding_engine.model_name if embedding is not None else None,
+            category=None, confidence=None, needs_review=False,
         )
-
-        # Re-resolve entities
-        if classification is not None:
-            try:
-                self.db.delete_mentions_for_thought(thought_id)
-                self.entity_resolver.resolve_entities(classification, thought_id)
-            except Exception as exc:
-                logger.warning("Entity re-resolution failed: %s", exc)
-
-        updated = self.db.get_thought(thought_id)
-        return updated.to_display()
+        return self.db.get_thought(thought_id).to_display()
 
     def delete(self, thought_id: str) -> dict:
         """Permanently delete a thought.
@@ -596,25 +247,9 @@ class StickyService:
         }
 
     def stats(self) -> dict:
-        """System stats including system info."""
-        db_stats = self.db.get_stats()
-
-        # Add system info
-        db_stats["system"] = {
-            "db_path": str(self.config.db_path),
-            "data_dir": str(self.config.data_dir),
-            "embedding_model": self.config.embedding_model,
-            "search_weights": {
-                "vector": self.config.search_vector_weight,
-                "fts": self.config.search_fts_weight,
-            },
-            "confidence_threshold": self.config.confidence_threshold,
-            "llm_model": self.config.openrouter_model,
-            "platform": platform.system(),
-            "python_version": platform.python_version(),
-        }
-
-        return db_stats
+        """Return local note counts and paths."""
+        total = self.db.execute("SELECT COUNT(*) FROM thoughts").fetchone()[0]
+        return {"thoughts": {"total": total}, "system": {"db_path": str(self.config.db_path), "data_dir": str(self.config.data_dir), "embedding_model": self.embedding_engine.model_name}}
 
     def export_data(
         self,
@@ -635,7 +270,7 @@ class StickyService:
         before = filters.get("before")
 
         thoughts, total = self.db.list_thoughts(
-            limit=100000,
+            limit=None,
             category=category,
             after=after,
             before=before,
@@ -651,8 +286,14 @@ class StickyService:
 
     def _export_json(self, thoughts: list[Thought], output_path: str) -> dict:
         """Export thoughts and entities to a JSON file."""
+        path = Path(output_path)
+        protected = [self.config.db_path, self.config.config_file]
+        protected.extend(Path(str(self.config.db_path) + suffix) for suffix in ("-wal", "-shm", "-journal"))
+        for active in protected:
+            if path.resolve() == active.resolve() or (path.exists() and active.exists() and path.samefile(active)):
+                raise ValueError("Export cannot overwrite Sticky's active database or configuration files")
         # Get all entities
-        entities, _ = self.db.list_entities(limit=100000)
+        entities, _ = self.db.list_entities(limit=None)
 
         data = {
             "exported_at": _now_iso(),
@@ -661,10 +302,18 @@ class StickyService:
             "entities": [e.model_dump() for e in entities],
         }
 
-        path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as file:
+                temporary = Path(file.name)
+                json.dump(data, file, indent=2, default=str)
+                file.flush()
+                os.fsync(file.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
         return {
             "format": "json",
@@ -678,21 +327,16 @@ class StickyService:
         """Export thoughts as individual markdown files with YAML frontmatter."""
         out_dir = Path(output_path)
         out_dir.mkdir(parents=True, exist_ok=True)
+        if any(out_dir.iterdir()):
+            raise FileExistsError("Markdown export requires an empty directory")
+        filenames = [_markdown_filename(thought) for thought in thoughts]
+        if len({name.casefold() for name in filenames}) != len(filenames):
+            raise ValueError("Markdown export filenames collide; use JSON to preserve these records")
 
         files: list[str] = []
         index_entries: list[str] = []
 
-        for thought in thoughts:
-            # Build filename: {date}_{id[:8]}_{slug}.md
-            try:
-                dt = datetime.fromisoformat(thought.created_at)
-                date_str = dt.strftime("%Y-%m-%d")
-            except (ValueError, TypeError):
-                date_str = "unknown"
-
-            slug = _slugify(thought.content)
-            short_id = thought.id[:8]
-            filename = f"{date_str}_{short_id}_{slug}.md"
+        for thought, filename in zip(thoughts, filenames):
 
             # Get entity mentions for frontmatter
             entity_rows = self.db.execute(
@@ -720,7 +364,7 @@ class StickyService:
             ]
 
             filepath = out_dir / filename
-            with open(filepath, "w", encoding="utf-8") as f:
+            with open(filepath, "x", encoding="utf-8") as f:
                 f.write("\n".join(lines))
 
             files.append(filename)
@@ -738,7 +382,7 @@ class StickyService:
             "",
         ] + index_entries + [""]
 
-        with open(out_dir / "_index.md", "w", encoding="utf-8") as f:
+        with open(out_dir / "_index.md", "x", encoding="utf-8") as f:
             f.write("\n".join(index_content))
 
         return {
@@ -767,7 +411,7 @@ class StickyService:
         if format == "auto":
             if path.is_dir():
                 format = "markdown"
-            elif path.suffix == ".json":
+            elif path.suffix.lower() == ".json":
                 format = "json"
             elif path.suffix in (".md", ".txt"):
                 format = "text"
@@ -784,35 +428,58 @@ class StickyService:
             raise ValueError(f"Unsupported import format: {format}")
 
     def _import_json(self, path: Path, dry_run: bool) -> dict:
-        """Import from a JSON export file."""
+        """Restore exported thoughts, or capture plain JSON notes without IDs."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        thoughts_data = data.get("thoughts", [])
+        if not isinstance(data, dict) or not isinstance(data.get("thoughts"), list):
+            raise ValueError("JSON import requires an object with a thoughts list")
+        thoughts_data = data["thoughts"]
         imported = 0
         skipped = 0
         errors: list[str] = []
+        seen_ids: set[str] = set()
 
         for td in thoughts_data:
-            thought_id = td.get("id")
-
-            # Check for duplicate
-            if thought_id and self.db.get_thought(thought_id) is not None:
-                skipped += 1
-                continue
-
-            if dry_run:
-                imported += 1
-                continue
-
             try:
-                content = td.get("content", "")
-                # Run full capture pipeline for imported thoughts
-                self.capture(
-                    content=content,
-                    source=td.get("source", "import"),
-                )
+                if not isinstance(td, dict):
+                    raise ValueError("Each thought must be an object")
+                thought_id = td.get("id")
+                if thought_id and (thought_id in seen_ids or self.db.get_thought(thought_id) is not None):
+                    skipped += 1
+                    continue
+                content = td.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("A thought must contain text")
+
+                if thought_id:
+                    # JSON exports contain the original record. Restore it without
+                    # reclassifying, assigning a new ID, or merging similar notes.
+                    thought = Thought.model_validate(
+                        {key: value for key, value in td.items() if key != "embedding"}
+                    )
+                    for field in ("created_at", "updated_at"):
+                        if _timestamp_key(getattr(thought, field))[0] != 0:
+                            raise ValueError(f"{field} must be an ISO date or datetime")
+                    if not dry_run:
+                        thought.embedding = self._embed(thought.content)
+                        thought.embedding_model = self.embedding_engine.model_name if thought.embedding is not None else None
+                        self.db.insert_thought(thought)
+                    seen_ids.add(thought_id)
+                else:
+                    # Plain JSON notes still use the normal capture pipeline.
+                    metadata = td.get("metadata")
+                    thread = metadata.get("thread") if isinstance(metadata, dict) else None
+                    plain = Thought(content=content, source=td.get("source", "import"), source_url=td.get("source_url"))
+                    if not dry_run:
+                        self.capture(content=plain.content, source=plain.source, source_url=plain.source_url, thread=thread)
                 imported += 1
+            except sqlite3.IntegrityError as exc:
+                # Another restore may commit the same ID after our initial read.
+                if thought_id and self.db.get_thought(thought_id) is not None:
+                    skipped += 1
+                else:
+                    errors.append(f"Failed to import thought: {exc}")
             except Exception as exc:
                 errors.append(f"Failed to import thought: {exc}")
 
@@ -826,6 +493,8 @@ class StickyService:
 
     def _import_markdown_dir(self, path: Path, dry_run: bool) -> dict:
         """Import from a directory of markdown files."""
+        if not path.is_dir():
+            raise ValueError("Markdown import requires an existing directory")
         imported = 0
         skipped = 0
         errors: list[str] = []
@@ -858,6 +527,8 @@ class StickyService:
                     skipped += 1
                     continue
 
+                if not content.strip():
+                    raise ValueError("A thought must contain text")
                 if dry_run:
                     imported += 1
                     continue
@@ -903,130 +574,13 @@ class StickyService:
             "format": "text",
         }
 
-    def related_thoughts(
-        self, thought_id: str, limit: int = 3
-    ) -> list[dict]:
-        """Find top N related thoughts with boosted scoring.
-
-        Uses sqlite-vec for initial candidates, then applies:
-        - Entity co-occurrence boost (+0.10 for 1 shared entity, +0.15 for 2+)
-        - Recency boost (+0.05 within 7 days, +0.03 within 30 days)
-        - Minimum score threshold (0.45) to filter low-quality matches
-        """
-        thought = self.db.get_thought(thought_id)
-        if thought is None or thought.embedding is None:
-            return []
-
-        # Fetch more candidates than needed for re-ranking
-        fetch_limit = max(limit * 4, 20)
-        if self.db.has_vec:
-            rows = self.db.execute(
-                """SELECT v.thought_id, v.distance, t.*
-                   FROM vec_thoughts v
-                   JOIN thoughts t ON t.id = v.thought_id
-                   WHERE v.embedding MATCH ? AND v.k = ?
-                   ORDER BY v.distance""",
-                (thought.embedding, fetch_limit),
-            ).fetchall()
-        else:
-            # Fallback: Python cosine similarity
-            all_rows = self.db.execute(
-                "SELECT * FROM thoughts WHERE id != ? AND embedding IS NOT NULL",
-                (thought_id,),
-            ).fetchall()
-            # Add a synthetic "distance" key
-            rows = []
-            for r in all_rows:
-                other = Thought.from_row(dict(r))
-                sim = self.embedding_engine.cosine_similarity(thought.embedding, other.embedding)
-                row_dict = dict(r)
-                row_dict["thought_id"] = r["id"]
-                row_dict["distance"] = 1.0 - sim
-                rows.append(row_dict)
-            rows.sort(key=lambda x: x["distance"])
-            rows = rows[:fetch_limit]
-
-        # Get entity IDs for the source thought
-        source_entity_rows = self.db.execute(
-            "SELECT entity_id FROM entity_mentions WHERE thought_id = ?",
-            (thought_id,),
-        ).fetchall()
-        source_entity_ids = {r["entity_id"] for r in source_entity_rows}
-
-        # Parse source thought's created_at for recency comparison
-        source_created = datetime.fromisoformat(thought.created_at)
-
-        scored_results = []
-        for row in rows:
-            if row["thought_id"] == thought_id:
-                continue
-
-            # Base score: cosine similarity
-            cosine_sim = max(0.0, 1.0 - row["distance"])
-
-            # Skip very dissimilar candidates early
-            if cosine_sim < 0.20:
-                continue
-
-            # Entity co-occurrence boost
-            entity_boost = 0.0
-            if source_entity_ids:
-                candidate_entity_rows = self.db.execute(
-                    "SELECT entity_id FROM entity_mentions WHERE thought_id = ?",
-                    (row["thought_id"],),
-                ).fetchall()
-                candidate_entity_ids = {r["entity_id"] for r in candidate_entity_rows}
-                shared_count = len(source_entity_ids & candidate_entity_ids)
-                if shared_count >= 2:
-                    entity_boost = 0.15
-                elif shared_count == 1:
-                    entity_boost = 0.10
-
-            # Recency boost
-            recency_boost = 0.0
-            try:
-                candidate_created = datetime.fromisoformat(row["created_at"])
-                days_apart = abs((source_created - candidate_created).days)
-                if days_apart <= 7:
-                    recency_boost = 0.05
-                elif days_apart <= 30:
-                    recency_boost = 0.03
-            except (ValueError, TypeError):
-                pass  # skip recency boost if date parsing fails
-
-            final_score = min(1.0, cosine_sim + entity_boost + recency_boost)
-
-            # Filter out low-quality matches
-            if final_score < 0.45:
-                continue
-
-            scored_results.append(
-                (final_score, Thought.from_row(dict(row)))
-            )
-
-        # Sort by final score descending, return top `limit`
-        scored_results.sort(key=lambda x: x[0], reverse=True)
-        return [
-            t.to_display(score=round(score, 6))
-            for score, t in scored_results[:limit]
-        ]
 
     def privacy_info(self) -> dict:
-        """Return privacy/data flow information."""
+        """Describe the active data flow without promising provider non-retention."""
         return {
-            "data_flow": {
-                "embeddings": "LOCAL",
-                "classification": "CLOUD",
-                "digest": "CLOUD",
-                "storage": "LOCAL",
-            },
-            "description": (
-                "Embeddings are generated locally using sentence-transformers. "
-                "Classification and digest generation use OpenRouter API (cloud). "
-                "All data is stored locally in SQLite."
-            ),
-            "data_dir": str(self.config.data_dir),
-            "db_path": str(self.config.db_path),
+            "data_flow": {"capture": "LOCAL", "embeddings": "LOCAL", "search": "LOCAL", "storage": "LOCAL", "digest": "CLOUD_ON_REQUEST"},
+            "description": "Capture, editing, embeddings, and search run locally. An explicitly requested digest sends selected notes to OpenRouter and its model provider. Provider logging and retention policies vary.",
+            "data_dir": str(self.config.data_dir), "db_path": str(self.config.db_path),
         }
 
     def get_config_display(self) -> dict:
@@ -1034,380 +588,15 @@ class StickyService:
         return self.config.to_display_dict()
 
     def set_config_value(self, key: str, value: Any) -> dict:
-        """Set a config value, returning previous value.
-
-        Also persists to config file.
-        """
-        previous = getattr(self.config, key)
-        self.config.set(key, value)
-
-        # Persist to config file
-        try:
-            self.config.save_to_file()
-        except Exception as exc:
-            logger.warning("Failed to save config to file: %s", exc)
-
-        return {
-            "key": key,
-            "previous": previous,
-            "new": value,
-        }
-
-    # ------------------------------------------------------------------
-    # Action items
-    # ------------------------------------------------------------------
-
-    def list_actions(self, completed: bool = False) -> dict:
-        """List action items.
-
-        Returns dict with actions list and total count.
-        """
-        items = self.db.list_action_items(completed=completed)
-        return {
-            "actions": [
-                {
-                    "id": item.id,
-                    "content": item.content,
-                    "person": item.person,
-                    "completed": item.completed,
-                    "created_at": item.created_at,
-                    "completed_at": item.completed_at,
-                    "expires_at": item.expires_at,
-                    "source_thought_id": item.source_thought_id,
-                }
-                for item in items
-            ],
-            "total": len(items),
-        }
-
-    def complete_action(self, action_id: str) -> dict:
-        """Mark an action item as complete.
-
-        Raises:
-            ValueError: If action_id not found.
-        """
-        # Verify it exists
-        rows = self.db.execute(
-            "SELECT * FROM action_items WHERE id = ?", (action_id,)
-        ).fetchall()
-
-        if not rows:
-            raise ValueError(f"Action item {action_id} not found")
-
-        self.db.complete_action_item(action_id)
-
-        return {
-            "id": action_id,
-            "completed": True,
-            "completed_at": _now_iso(),
-        }
-
-    def entity_context_summary(self, entity_id: str) -> str:
-        """Generate a 2-3 line summary for a pinned person context.
-
-        Uses recent thoughts mentioning this entity.
-        """
-        entity = self.db.get_entity(entity_id)
-        if entity is None:
-            return "No entity found with this ID."
-
-        thoughts = self.db.get_thoughts_for_entity(entity_id, limit=5)
-        if not thoughts:
-            return f"{entity.name}: No recent thoughts found."
-
-        # Build a simple summary from recent thoughts
-        snippets = []
-        for t in thoughts[:3]:
-            snippet = t.content[:100].replace("\n", " ")
-            snippets.append(snippet)
-
-        summary_parts = [
-            f"{entity.name} ({entity.entity_type}) - "
-            f"mentioned {entity.mention_count} time(s).",
-        ]
-        summary_parts.append(
-            "Recent context: " + "; ".join(snippets) + "."
-        )
-
-        return " ".join(summary_parts)
-
-    def reclassify_batch(
-        self,
-        confidence_threshold: float | None = None,
-    ) -> dict:
-        """Re-run LLM classifier on thoughts with null category or low confidence.
-
-        Queries thoughts where category IS NULL or confidence < threshold,
-        re-classifies each via the LLM, updates the DB, and resolves entities.
-
-        Args:
-            confidence_threshold: Minimum confidence to skip reclassification.
-                Defaults to ``self.config.confidence_threshold``.
-
-        Returns:
-            Dict with reclassified, total_candidates, errors, and results.
-        """
-        threshold = (
-            confidence_threshold
-            if confidence_threshold is not None
-            else self.config.confidence_threshold
-        )
-
-        rows = self.db.execute(
-            "SELECT * FROM thoughts WHERE category IS NULL OR confidence < ?",
-            (threshold,),
-        ).fetchall()
-
-        candidates = [Thought.from_row(dict(r)) for r in rows]
-        total_candidates = len(candidates)
-
-        reclassified = 0
-        errors: list[str] = []
-        results: list[dict] = []
-
-        for thought in candidates:
-            old_category = thought.category
-            try:
-                classification = self.classifier.classify_sync(thought.content)
-            except Exception as exc:
-                logger.warning(
-                    "Reclassify failed for thought %s: %s", thought.id, exc
-                )
-                errors.append(f"{thought.id}: {exc}")
-                continue
-
-            new_category = classification.category
-            new_confidence = classification.confidence
-            new_needs_review = new_confidence < threshold
-
-            self.db.update_thought(
-                thought.id,
-                category=new_category,
-                confidence=new_confidence,
-                needs_review=new_needs_review,
-            )
-
-            # Resolve entities from the new classification
-            try:
-                self.entity_resolver.resolve_entities(classification, thought.id)
-            except Exception as exc:
-                logger.warning(
-                    "Entity resolution failed for thought %s: %s",
-                    thought.id,
-                    exc,
-                )
-
-            reclassified += 1
-            preview = thought.content[:80].replace("\n", " ")
-            results.append({
-                "id": thought.id,
-                "content_preview": preview,
-                "old_category": old_category,
-                "new_category": new_category,
-                "confidence": new_confidence,
-            })
-
-        return {
-            "reclassified": reclassified,
-            "total_candidates": total_candidates,
-            "errors": errors,
-            "results": results,
-        }
-
-    def brief(self) -> dict:
-        """Generate a fast, local-only morning briefing. No LLM calls."""
-        # 1. Count new thoughts since last digest
-        rows = self.db.execute(
-            "SELECT period_end FROM digests ORDER BY created_at DESC LIMIT 1"
-        ).fetchall()
-        if rows:
-            last_digest_end = rows[0]["period_end"]
-            count_row = self.db.execute(
-                "SELECT COUNT(*) FROM thoughts WHERE created_at > ?",
-                (last_digest_end,),
-            ).fetchone()
-            new_thoughts = count_row[0] if count_row else 0
-        else:
-            count_row = self.db.execute("SELECT COUNT(*) FROM thoughts").fetchone()
-            new_thoughts = count_row[0] if count_row else 0
-
-        # 2. Open action items (top 5, non-expired)
-        now_iso = datetime.now(timezone.utc).isoformat()
-        actions = self.db.list_action_items(completed=False, limit=10)
-        action_dicts = [
-            {"content": a.content, "person": a.person, "created_at": a.created_at}
-            for a in actions
-            if not (a.expires_at and a.expires_at < now_iso)
-        ][:5]
-
-        # 3. Entity pulse — most mentioned in last 7 days
-        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        pulse_rows = self.db.execute(
-            """SELECT e.name, e.entity_type, COUNT(*) as recent_mentions
-               FROM entity_mentions em
-               JOIN entities e ON e.id = em.entity_id
-               WHERE em.created_at > ?
-               GROUP BY e.id
-               ORDER BY recent_mentions DESC
-               LIMIT 5""",
-            (week_ago,),
-        ).fetchall()
-        entity_pulse = [
-            {"name": r["name"], "type": r["entity_type"], "mentions": r["recent_mentions"]}
-            for r in pulse_rows
-        ]
-
-        # 4. Resurface one older thought connected to recent activity
-        resurfaced = None
-        if entity_pulse:
-            top_entity_name = entity_pulse[0]["name"]
-            resurface_rows = self.db.execute(
-                """SELECT t.* FROM thoughts t
-                   JOIN entity_mentions em ON em.thought_id = t.id
-                   JOIN entities e ON e.id = em.entity_id
-                   WHERE e.name = ? COLLATE NOCASE
-                     AND t.created_at < ?
-                   ORDER BY t.created_at ASC
-                   LIMIT 1""",
-                (top_entity_name, week_ago),
-            ).fetchall()
-            if resurface_rows:
-                t = Thought.from_row(dict(resurface_rows[0]))
-                resurfaced = {
-                    "id": t.id,
-                    "content": t.content,
-                    "category": t.category,
-                    "created_at": t.created_at,
-                }
-
-        # 5. Review count
-        review_row = self.db.execute(
-            "SELECT COUNT(*) FROM thoughts WHERE needs_review = 1"
-        ).fetchone()
-        review_count = review_row[0] if review_row else 0
-
-        return {
-            "new_thoughts": new_thoughts,
-            "action_items": action_dicts,
-            "entity_pulse": entity_pulse,
-            "resurfaced": resurfaced,
-            "review_count": review_count,
-        }
-
-    def synthesize(self, entity_name: str) -> dict:
-        """Synthesize everything known about an entity via LLM."""
-        # Find entity
-        entity = self.db.get_entity_by_name(entity_name)
-        if entity is None:
-            return {
-                "entity": entity_name,
-                "synthesis": f"No entity found matching '{entity_name}'.",
-                "thought_count": 0,
-                "thought_ids": [],
-            }
-
-        # Get all linked thoughts
-        rows = self.db.execute(
-            """SELECT t.* FROM thoughts t
-               JOIN entity_mentions em ON em.thought_id = t.id
-               WHERE em.entity_id = ?
-               ORDER BY t.created_at ASC""",
-            (entity.id,),
-        ).fetchall()
-
-        if not rows:
-            return {
-                "entity": entity_name,
-                "entity_type": entity.entity_type,
-                "synthesis": f"No thoughts found linked to '{entity_name}'.",
-                "thought_count": 0,
-                "thought_ids": [],
-            }
-
-        thoughts = [Thought.from_row(dict(r)) for r in rows]
-
-        # Build prompt
-        thought_text = "\n\n".join(
-            f"[{i+1}] ({t.created_at[:10]}) {t.content}"
-            for i, t in enumerate(thoughts)
-        )
-
-        synthesis_prompt = (
-            f'Summarize everything the user knows about "{entity_name}" '
-            f"based on their captured thoughts.\n\n"
-            f"Thoughts (chronological):\n{thought_text}\n\n"
-            "Write a concise synthesis (2-4 paragraphs) that:\n"
-            "1. Summarizes the key facts and insights\n"
-            "2. Notes any open questions or contradictions\n"
-            "3. Highlights action items if any\n"
-            "4. References thought numbers [N] for provenance\n\n"
-            "Do not add information not present in the thoughts."
-        )
-
-        # Call LLM
-        try:
-            import asyncio
-
-            import httpx
-
-            async def _call_llm():
-                headers = {
-                    "Authorization": f"Bearer {self.classifier.api_key}",
-                    "Content-Type": "application/json",
-                }
-                body = {
-                    "model": self.classifier.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a knowledge synthesis assistant. "
-                                "Summarize the user's captured thoughts into "
-                                "a coherent narrative."
-                            ),
-                        },
-                        {"role": "user", "content": synthesis_prompt},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 1000,
-                }
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers=headers,
-                        json=body,
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    return data["choices"][0]["message"]["content"]
-
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop is None:
-                synthesis_text = asyncio.run(_call_llm())
-            else:
-                from concurrent.futures import ThreadPoolExecutor
-
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _call_llm())
-                    synthesis_text = future.result()
-
-        except Exception as exc:
-            logger.warning("Synthesis LLM call failed: %s", exc)
-            synthesis_text = (
-                "LLM synthesis unavailable. Raw thoughts:\n\n" + thought_text
-            )
-
-        return {
-            "entity": entity_name,
-            "entity_type": entity.entity_type,
-            "synthesis": synthesis_text,
-            "thought_count": len(thoughts),
-            "thought_ids": [t.id for t in thoughts],
-        }
+        """Save a validated setting for the next session; mask secret receipts."""
+        updated = self.config.model_copy()
+        previous = updated.set(key, value)
+        updated.save_to_file()
+        current = getattr(updated, key)
+        if key == "openrouter_api_key":
+            previous = "configured" if previous else "unset"
+            current = "configured" if current else "unset"
+        return {"key": key, "previous": previous, "new": str(current) if isinstance(current, Path) else current}
 
     @property
     def conn(self):

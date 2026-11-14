@@ -1,13 +1,15 @@
 """Tests for the sticky database layer."""
 
 import json
+import base64
+import sqlite3
 import struct
 import time
 from datetime import datetime, timezone
 
 import pytest
 
-from sticky.core.db import Database
+from sticky.core.db import Database, encode_cursor
 from sticky.core.models import (
     ActionItem,
     Digest,
@@ -73,6 +75,130 @@ def test_initialize_creates_tables(db):
 def test_initialize_idempotent(db):
     """Calling initialize() twice should not raise."""
     db.initialize()
+
+
+def test_vector_availability_is_per_connection(tmp_data_dir, monkeypatch):
+    import sqlite_vec
+
+    load = sqlite_vec.load
+    fallback = Database(tmp_data_dir / "fallback.db")
+    indexed = Database(tmp_data_dir / "indexed.db")
+    try:
+        monkeypatch.setattr(sqlite_vec, "load", lambda conn: (_ for _ in ()).throw(OSError("Unavailable")))
+        fallback.initialize()
+        assert not fallback.has_vec
+        monkeypatch.setattr(sqlite_vec, "load", load)
+        indexed.initialize()
+        assert indexed.has_vec and not fallback.has_vec
+        note = _make_thought(embedding=DUMMY_EMBEDDING)
+        fallback.insert_thought(note)
+        assert fallback.get_thought(note.id).content == note.content
+        assert fallback.fts_search("thought")[0]["id"] == note.id
+        fallback.update_thought(note.id, content="Edited fallback", embedding=None)
+        assert fallback.fts_search("Edited")[0]["id"] == note.id
+        fallback.delete_thought(note.id)
+        assert fallback.get_thought(note.id) is None
+        fallback.close()
+        fallback.initialize()
+        assert fallback.has_vec
+    finally:
+        fallback.close()
+        indexed.close()
+
+
+def test_vector_index_recovers_edits_and_deletes_during_outage(tmp_data_dir, monkeypatch):
+    import sqlite_vec
+
+    database = Database(tmp_data_dir / "outage.db")
+    old = struct.pack("384f", 1.0, *([0.0] * 383))
+    replacement = struct.pack("384f", 0.0, 1.0, *([0.0] * 382))
+    try:
+        database.initialize()
+        for note_id in ("edited", "deleted", "cleared"):
+            database.insert_thought(_make_thought(id=note_id, content="Old bananas", embedding=old))
+        database.close()
+        with monkeypatch.context() as unavailable:
+            unavailable.setattr(sqlite_vec, "load", lambda conn: (_ for _ in ()).throw(OSError("Unavailable")))
+            database.initialize()
+            assert not database.has_vec
+            database.update_thought("edited", content="Passport renewal", embedding=replacement)
+            database.update_thought("cleared", embedding=None)
+            database.delete_thought("deleted")
+            database.insert_thought(_make_thought(id="legacy", embedding=b"old unsupported bytes"))
+            database.close()
+        database.initialize()
+        rows = database.execute("SELECT thought_id, embedding FROM vec_thoughts").fetchall()
+        assert {row["thought_id"]: row["embedding"] for row in rows} == {"edited": replacement}
+        assert database.fts_search("Passport")[0]["id"] == "edited"
+        assert database.get_thought("cleared").embedding is None
+        assert database.get_thought("legacy").embedding == b"old unsupported bytes"
+    finally:
+        database.close()
+
+
+def test_failed_vector_rebuild_retains_previous_index(db):
+    original = _make_thought(embedding=DUMMY_EMBEDDING)
+    db.insert_thought(original)
+    conn = db._get_conn()
+    conn.set_authorizer(lambda action, table, *args: sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_INSERT and table == "vec_thoughts" else sqlite3.SQLITE_OK)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            db.initialize()
+    finally:
+        conn.set_authorizer(None)
+    assert not conn.in_transaction
+    assert db.execute("SELECT thought_id FROM vec_thoughts").fetchone()[0] == original.id
+
+
+@pytest.mark.parametrize("sort", ["created_at_asc", "created_at_desc"])
+def test_offset_and_microsecond_timestamps_page_chronologically(db, sort):
+    timestamps = {
+        "a": "2026-10-07T12:00:00.000001+02:00",
+        "b": "2026-10-07T10:00:00.000002Z",
+        "c": "2026-10-07T06:00:00.000002-04:00",
+        "d": "2026-10-07T11:00:00+00:00",
+        "e": "2026-10-07",
+    }
+    for note_id, timestamp in timestamps.items():
+        db.insert_thought(_make_thought(id=note_id, created_at=timestamp))
+    expected = ["e", "a", "b", "c", "d"]
+    if sort == "created_at_desc":
+        expected.reverse()
+    found = []
+    cursor = None
+    while True:
+        page, total = db.list_thoughts(limit=2, sort=sort, cursor=cursor)
+        assert total == len(timestamps)
+        if not page:
+            break
+        found.extend(note.id for note in page)
+        assert all(note.created_at == timestamps[note.id] for note in page)
+        cursor = encode_cursor(page[-1], sort)
+    assert found == expected
+    later, _ = db.list_thoughts(after=timestamps["a"])
+    assert {note.id for note in later} == {"b", "c", "d"}
+    earlier, _ = db.list_thoughts(before=timestamps["c"])
+    assert {note.id for note in earlier} == {"e", "a"}
+
+
+@pytest.mark.parametrize("field", ["after", "before"])
+def test_invalid_date_filter_fails_clearly(db, field):
+    with pytest.raises(ValueError, match=field):
+        db.list_thoughts(**{field: "not-a-date"})
+
+
+@pytest.mark.parametrize("sort", ["created_at_asc", "created_at_desc"])
+@pytest.mark.parametrize("legacy_timestamp", ["banana", ""])
+def test_legacy_invalid_timestamp_remains_pageable(db, sort, legacy_timestamp):
+    for note_id, timestamp in (("valid", "2026-10-07"), ("legacy", legacy_timestamp)):
+        db.insert_thought(_make_thought(id=note_id, created_at=timestamp))
+    first, _ = db.list_thoughts(limit=1, sort=sort)
+    second, _ = db.list_thoughts(limit=1, sort=sort, cursor=encode_cursor(first[0], sort))
+    assert {first[0].id, second[0].id} == {"valid", "legacy"}
+    future, _ = db.list_thoughts(after="2099-01-01")
+    assert future == []
+    bounded, _ = db.list_thoughts(before="2099-01-01")
+    assert [note.id for note in bounded] == ["valid"]
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +316,44 @@ def test_list_thoughts_with_cursor(db):
     assert page1_ids.isdisjoint(page2_ids)
 
 
+@pytest.mark.parametrize("sort", ["created_at_asc", "created_at_desc"])
+def test_cursor_pages_timestamp_ties_without_losing_records(db, sort):
+    """The ID tie-breaker works in both directions, including filtered pages."""
+    for i in range(7):
+        db.insert_thought(_make_thought(
+            id=f"note-{i}", content=f"Note {i}", category="work",
+            created_at="2024-01-01T00:00:00+00:00",
+        ))
+    db.insert_thought(_make_thought(category="other"))
+
+    cursor = None
+    seen = []
+    while True:
+        page, total = db.list_thoughts(
+            limit=2, cursor=cursor, category="work", sort=sort,
+        )
+        assert total == 7
+        if not page:
+            break
+        seen.extend(thought.id for thought in page)
+        cursor = encode_cursor(page[-1], sort)
+
+    assert seen == sorted(
+        [f"note-{i}" for i in range(7)], reverse=sort.endswith("desc"),
+    )
+
+
+@pytest.mark.parametrize("cursor", [
+    "garbage", "", "2024-99-99",
+    base64.urlsafe_b64encode(b'[]').decode(),
+    base64.urlsafe_b64encode(b'["not a date","note-id"]').decode(),
+    base64.urlsafe_b64encode(b'["2024-01-01",null]').decode(),
+])
+def test_cursor_rejects_invalid_payloads(db, cursor):
+    with pytest.raises(ValueError, match="Invalid pagination cursor"):
+        db.list_thoughts(cursor=cursor)
+
+
 def test_list_thoughts_with_date_filter(db):
     """list_thoughts can filter by after/before dates."""
     db.insert_thought(
@@ -274,6 +438,45 @@ def test_update_thought_embedding(db):
     assert updated.embedding == DUMMY_EMBEDDING
 
 
+def test_nullable_fields_are_preserved_when_omitted(db):
+    thought = _make_thought(
+        embedding=DUMMY_EMBEDDING, embedding_model="all-MiniLM-L6-v2",
+        category="work", confidence=0.9,
+    )
+    db.insert_thought(thought)
+    db.update_thought(thought.id, metadata={"thread": "work"})
+    updated = db.get_thought(thought.id)
+    assert updated.embedding == thought.embedding
+    assert updated.embedding_model == thought.embedding_model
+    assert updated.category == thought.category
+    assert updated.confidence == thought.confidence
+
+
+def test_nullable_fields_can_be_cleared_with_none(db):
+    thought = _make_thought(
+        content="bananas", embedding=DUMMY_EMBEDDING,
+        embedding_model="all-MiniLM-L6-v2", category="work", confidence=0.9,
+    )
+    db.insert_thought(thought)
+    db.update_thought(
+        thought.id, content="passport", embedding=None, embedding_model=None,
+        category=None, confidence=None,
+    )
+    updated = db.get_thought(thought.id)
+    assert updated.content == "passport"
+    assert updated.embedding is None
+    assert updated.embedding_model is None
+    assert updated.category is None
+    assert updated.confidence is None
+    assert db.fts_search("bananas") == []
+    assert db.fts_search("passport")[0]["id"] == thought.id
+    if db.has_vec:
+        assert not db.execute(
+            "SELECT thought_id FROM vec_thoughts WHERE thought_id = ?",
+            (thought.id,),
+        ).fetchall()
+
+
 def test_delete_thought(db):
     """delete_thought removes a thought and returns content preview."""
     thought = _make_thought(content="Some content to delete")
@@ -288,6 +491,31 @@ def test_delete_thought(db):
 def test_delete_thought_not_found(db):
     """delete_thought returns None for nonexistent ID."""
     assert db.delete_thought("nonexistent-id") is None
+
+
+def test_edit_and_delete_keep_legacy_history_coherent(db):
+    """Edits preserve archived enrichment; deletion removes links but keeps history."""
+    thought = _make_thought(content="bananas", embedding=DUMMY_EMBEDDING)
+    db.insert_thought(thought)
+    entity = _make_entity()
+    db.insert_entity(entity)
+    db.insert_entity_mention(EntityMention(entity_id=entity.id, thought_id=thought.id))
+    action = ActionItem(content="historical bananas task", source_thought_id=thought.id)
+    db.insert_action_item(action)
+    db.complete_action_item(action.id)
+
+    db.update_thought(thought.id, content="passport", embedding=None)
+    assert db.get_thoughts_for_entity(entity.id)[0].id == thought.id
+    assert db.list_action_items(completed=True)[0].source_thought_id == thought.id
+
+    db.delete_thought(thought.id)
+    assert db.fts_search("passport") == []
+    assert db.get_thoughts_for_entity(entity.id) == []
+    assert db.get_entity(entity.id) is not None
+    archived = db.list_action_items(completed=True)[0]
+    assert archived.content == action.content
+    assert archived.source_thought_id is None
+    assert archived.completed is True
 
 
 # ---------------------------------------------------------------------------
@@ -697,3 +925,95 @@ def test_vec_insert_and_query(db):
     assert rows[0]["thought_id"] == thought.id
     # Cosine distance between identical vectors should be ~0
     assert rows[0]["distance"] < 0.01
+
+
+@requires_vec
+def test_vector_replacement_failure_rolls_back_text_and_indexes(db):
+    embedding = struct.pack("384f", *([1.0] * 384))
+    thought = _make_thought(
+        content="original bananas", embedding=embedding,
+        embedding_model="all-MiniLM-L6-v2", category="work", confidence=0.9,
+    )
+    db.insert_thought(thought)
+    with pytest.raises(sqlite3.Error):
+        db.update_thought(
+            thought.id, content="changed passport", category=None,
+            embedding=struct.pack("768f", *([1.0] * 768)),
+        )
+    assert db.get_thought(thought.id).model_dump() == thought.model_dump()
+    assert db.fts_search("passport") == []
+    assert db.fts_search("bananas")[0]["id"] == thought.id
+    row = db.execute(
+        "SELECT thought_id, distance FROM vec_thoughts WHERE embedding MATCH ? AND k=1",
+        (embedding,),
+    ).fetchone()
+    assert row["thought_id"] == thought.id
+    assert row["distance"] < 0.01
+    assert not db._get_conn().in_transaction
+
+
+@requires_vec
+def test_vector_insert_failure_leaves_no_partial_record(db):
+    thought = _make_thought(
+        content="fresh bananas", embedding=struct.pack("768f", *([1.0] * 768)),
+    )
+    with pytest.raises(sqlite3.Error):
+        db.insert_thought(thought)
+    assert db.get_thought(thought.id) is None
+    assert db.fts_search("bananas") == []
+    assert not db._get_conn().in_transaction
+    thought.embedding = struct.pack("384f", *([1.0] * 384))
+    db.insert_thought(thought)
+    assert db.get_thought(thought.id) is not None
+
+
+def test_stdlib_backup_restores_live_database_and_legacy_history(db, tmp_path):
+    """Documented sqlite3 backup works while Sticky's WAL connection is open."""
+    thought = _make_thought(
+        content="backup searchable bananas", embedding=struct.pack("384f", *([1.0] * 384)),
+        metadata={"thread": "recovery"}, source_url="https://example.com/source",
+    )
+    db.insert_thought(thought)
+    entity = _make_entity(aliases=["Ally"])
+    db.insert_entity(entity)
+    db.insert_entity_mention(EntityMention(
+        entity_id=entity.id, thought_id=thought.id, context="historical link",
+    ))
+    action = ActionItem(content="Archived task", source_thought_id=thought.id)
+    db.insert_action_item(action)
+    db.complete_action_item(action.id)
+    digest = Digest(
+        content="Archived digest", thought_ids=[thought.id],
+        period_start="2024-01-01", period_end="2024-01-02",
+    )
+    db.insert_digest(digest)
+    db.set_config_value("history", "preserved")
+
+    backup_path = tmp_path / "sticky-backup.db"
+    # Exact documented route: ordinary sqlite3 connections, no extension needed.
+    with sqlite3.connect(db._db_path) as source:
+        with sqlite3.connect(backup_path) as target:
+            source.backup(target)
+    source.close()
+    target.close()
+
+    restored = Database(backup_path)
+    try:
+        restored.initialize()
+        assert restored.get_thought(thought.id).model_dump() == thought.model_dump()
+        assert restored.fts_search("bananas")[0]["id"] == thought.id
+        assert restored.get_entity_by_name("Ally").id == entity.id
+        assert restored.get_thoughts_for_entity(entity.id)[0].id == thought.id
+        assert restored.list_action_items(completed=True)[0].source_thought_id == thought.id
+        assert restored.list_action_items(completed=True)[0].completed_at is not None
+        assert restored.list_digests()[0].model_dump() == digest.model_dump()
+        assert restored.get_config_value("history") == "preserved"
+        if restored.has_vec:
+            row = restored.execute(
+                "SELECT thought_id, distance FROM vec_thoughts WHERE embedding MATCH ? AND k=1",
+                (thought.embedding,),
+            ).fetchone()
+            assert row["thought_id"] == thought.id
+            assert row["distance"] < 0.01
+    finally:
+        restored.close()

@@ -1,8 +1,9 @@
-"""End-to-end integration tests for sticky."""
+"""End-to-end local capture, search, editing, and JSON recovery."""
 
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from sticky.core.service import StickyService
@@ -10,148 +11,134 @@ from sticky.core.service import StickyService
 
 @pytest.fixture
 def service(tmp_data_dir, monkeypatch):
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Local operations must not call the cloud")
+    monkeypatch.setattr(httpx.Client, "post", forbidden)
+    monkeypatch.setattr(httpx.AsyncClient, "post", forbidden)
     svc = StickyService(data_dir=tmp_data_dir)
     svc.initialize()
-    return svc
+    yield svc
+    svc.db.close()
 
 
 def test_full_capture_search_pipeline(service):
-    """Capture -> search -> find it."""
-    result = service.capture("Sarah mentioned she's thinking about leaving the team")
-    assert result["id"]
-    assert result["content"] == "Sarah mentioned she's thinking about leaving the team"
-
+    note = service.capture("Sarah mentioned she's thinking about leaving the team")
+    assert note["category"] is None
+    assert note["confidence"] is None
     results = service.search("career changes")
-    assert len(results) > 0
-    # The thought about Sarah should be found via semantic search
-    contents = [r["content"] for r in results]
-    assert any("Sarah" in c for c in contents)
+    assert any(result["id"] == note["id"] for result in results)
 
 
-def test_capture_search_delete_pipeline(service):
-    """Capture -> search -> delete -> search again (not found)."""
-    result = service.capture("unique test thought about quantum computing")
-    thought_id = result["id"]
-
-    # Should find it
-    results = service.search("quantum computing")
-    assert any(r["id"] == thought_id for r in results)
-
-    # Delete it
-    service.delete(thought_id)
-
-    # Should not find it anymore
-    results = service.search("quantum computing")
-    assert not any(r.get("id") == thought_id for r in results)
+def test_changed_fact_and_repeated_text_all_persist(service):
+    notes = [service.capture(text) for text in (
+        "Meeting with Sarah at 2 pm tomorrow", "Meeting with Sarah at 3 pm tomorrow",
+        "Meeting with Sarah at 2 pm tomorrow", "Call Steve on Monday", "Call Steve on Tuesday",
+    )]
+    assert len({note["id"] for note in notes}) == 5
+    assert service.stats()["thoughts"]["total"] == 5
+    assert {result["id"] for result in service.search("Sarah", limit=5)}.issuperset(
+        note["id"] for note in notes[:3]
+    )
 
 
-def test_capture_update_search_pipeline(service):
-    """Capture -> update -> search with new terms."""
-    result = service.capture("old content about databases")
-    thought_id = result["id"]
-
-    service.update(thought_id, "new content about machine learning algorithms")
-
-    results = service.search("machine learning")
-    assert any(r["id"] == thought_id for r in results)
-
-
-def test_export_import_roundtrip_json(service, tmp_path):
-    """Capture -> export JSON -> clear -> import -> verify."""
-    service.capture("thought one about testing")
-    service.capture("thought two about integration")
-
-    # Export
-    export_path = str(tmp_path / "export.json")
-    export_result = service.export_data("json", export_path)
-    assert export_result["count"] == 2
-
-    # Verify file exists and is valid JSON
-    data = json.loads(Path(export_path).read_text())
-    assert len(data["thoughts"]) == 2
+def test_capture_edit_search_delete_pipeline(service):
+    note = service.capture("old content about databases", thread="learning", source_url="https://example.org")
+    service.classify_thought(note["id"], "reference")
+    edited = service.update(note["id"], "new content about machine learning algorithms")
+    assert edited["category"] is None
+    assert edited["metadata"]["thread"] == "learning"
+    assert edited["source_url"] == "https://example.org"
+    assert any(result["id"] == note["id"] for result in service.search("machine learning"))
+    service.delete(note["id"])
+    assert not any(result["id"] == note["id"] for result in service.search("machine learning"))
 
 
-def test_export_import_roundtrip_markdown(service, tmp_path):
-    """Capture -> export markdown -> verify files."""
-    service.capture("markdown export test thought")
-
-    export_dir = str(tmp_path / "md_export")
-    result = service.export_data("markdown", export_dir)
-    assert result["count"] == 1
-
-    # Verify markdown files exist
-    md_files = list(Path(export_dir).glob("*.md"))
-    assert len(md_files) >= 2  # thought file + _index.md
-
-
-def test_digest_pipeline(service):
-    """Capture several thoughts -> generate digest."""
-    service.capture("Meeting with Sarah about Q3 roadmap")
-    service.capture("Auth migration blocked by API team")
-    service.capture("Marcus raised concerns about backward compatibility")
-
-    digest = service.digest(period="day")
-    assert digest["thought_count"] == 3
-    assert digest["digest"] is not None
-    assert len(digest["digest"]) > 0
+def test_json_restore_into_fresh_database(service, tmp_path):
+    first = service.capture("thought one about testing", thread="testing", source_url="https://example.org")
+    service.classify_thought(first["id"], "reference")
+    second = service.capture("thought two about integration")
+    path = tmp_path / "export.json"
+    assert service.export_data("json", str(path))["count"] == 2
+    assert len(json.loads(path.read_text(encoding="utf-8"))["thoughts"]) == 2
+    restored = StickyService(data_dir=tmp_path / "restored")
+    restored.initialize()
+    try:
+        receipt = restored.import_data(str(path))
+        assert receipt["imported"] == 2 and not receipt["errors"]
+        record = restored.get_thought(first["id"])
+        assert record["metadata"]["thread"] == "testing"
+        assert record["source_url"] == "https://example.org"
+        assert record["created_at"] == first["created_at"]
+        assert record["category"] == "reference"
+        assert any(result["id"] == second["id"] for result in restored.search("integration"))
+        assert restored.import_data(str(path))["skipped"] == 2
+    finally:
+        restored.db.close()
 
 
-def test_entity_tracking(service):
-    """Capture thoughts mentioning people -> verify entities tracked."""
-    service.capture("Sarah mentioned she wants to move to platform team")
-    service.capture("Meeting with Sarah about Q3 goals")
-
-    entities = service.list_entities(entity_type="person")
-    # Note: entities may or may not be extracted depending on LLM availability.
-    # In test mode (test-key), LLM returns None, so entities come from
-    # classification which also returns None.  This test verifies the pipeline
-    # doesn't crash.
-    assert "entities" in entities
-    assert "total" in entities
+def test_markdown_export_preserves_one_file_per_note(service, tmp_path):
+    notes = [service.capture("same repeated content") for _ in range(2)]
+    directory = tmp_path / "markdown"
+    receipt = service.export_data("markdown", str(directory))
+    assert receipt["count"] == 2
+    files = [path for path in directory.glob("*.md") if path.name != "_index.md"]
+    assert len(files) == 2
+    for note in notes:
+        assert any(note["id"] in path.read_text(encoding="utf-8") for path in files)
 
 
-def test_related_thoughts(service):
-    """Capture related thoughts -> find related."""
-    r1 = service.capture("Python is great for data science")
-    r2 = service.capture("Machine learning with Python and scikit-learn")
-    r3 = service.capture("Cooking pasta for dinner tonight")
-
-    related = service.related_thoughts(r1["id"], limit=2)
-    assert isinstance(related, list)
-    # The ML thought should be more related to Python than cooking
-    if len(related) >= 2:
-        related_ids = [r["id"] for r in related]
-        assert r2["id"] in related_ids
-
-
-def test_stats_after_operations(service):
-    """Various operations -> stats reflect them."""
-    service.capture("thought 1")
-    service.capture("thought 2")
-    service.capture("thought 3")
-
-    stats = service.stats()
-    assert stats["thoughts"]["total"] == 3
-    assert "system" in stats
-    assert stats["system"]["embedding_model"] == "all-MiniLM-L6-v2"
+def test_digest_explicit_request_only(service, monkeypatch):
+    note = service.capture("Meeting about Q3 roadmap")
+    calls = []
+    def response(self, url, **kwargs):
+        calls.append(kwargs["json"])
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Q3 roadmap discussed [1]."}}]},
+                              request=httpx.Request("POST", url))
+    monkeypatch.setattr(httpx.Client, "post", response)
+    result = service.digest()
+    assert len(calls) == 1
+    assert note["content"] in calls[0]["messages"][1]["content"]
+    assert result["thought_ids"] == [note["id"]]
+    assert result["thought_count"] == 1
+    assert service.get_thought(note["id"])["content"] == note["content"]
 
 
-def test_privacy_info(service):
-    """Privacy info returns correct data flow."""
+def test_missing_key_digest_never_calls_network(service):
+    service.capture("keep this locally")
+    service.config.openrouter_api_key = ""
+    with pytest.raises(ValueError, match="API key"):
+        service.digest()
+    assert service.stats()["thoughts"]["total"] == 1
+
+
+def test_privacy_matches_active_flow(service):
     info = service.privacy_info()
-    assert info["data_flow"]["embeddings"] == "LOCAL"
-    assert info["data_flow"]["classification"] == "CLOUD"
+    assert info["data_flow"]["capture"] == "LOCAL"
+    assert info["data_flow"]["search"] == "LOCAL"
     assert info["data_flow"]["storage"] == "LOCAL"
+    assert info["data_flow"]["digest"] == "CLOUD_ON_REQUEST"
+    assert "retention policies vary" in info["description"]
 
 
-def test_config_roundtrip(service):
-    """Get and set config values."""
-    display = service.get_config_display()
-    assert "confidence_threshold" in display
+def test_configuration_write_is_validated_and_masks_keys(service):
+    assert "confidence_threshold" not in service.get_config_display()
+    result = service.set_config_value("default_search_limit", "5")
+    assert result["previous"] == 10
+    assert result["new"] == 5
+    with pytest.raises(ValueError):
+        service.set_config_value("default_list_limit", "0")
+    result = service.set_config_value("openrouter_api_key", "dummy-new-secret")
+    assert result["new"] == "configured"
+    assert "dummy-new-secret" not in str(result)
 
-    old_value = service.config.confidence_threshold
-    result = service.set_config_value("confidence_threshold", "0.5")
-    assert result["previous"] == old_value
-    assert result["new"] == "0.5"
-    assert result["key"] == "confidence_threshold"
+
+def test_saved_setting_applies_next_session(service):
+    previous = service.config.default_search_limit
+    service.set_config_value("default_search_limit", "5")
+    assert service.config.default_search_limit == previous
+    next_session = StickyService(data_dir=service.config.data_dir)
+    try:
+        assert next_session.config.default_search_limit == 5
+        assert next_session.embedding_engine.model_name == "all-MiniLM-L6-v2"
+    finally:
+        next_session.db.close()

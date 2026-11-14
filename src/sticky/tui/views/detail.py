@@ -1,829 +1,306 @@
-"""Detail screen for viewing a single thought.
-
-Features:
-- Header with prev/next navigation through a context list
-- Full content display
-- Metadata panel: category, confidence, source, timestamps, ULID, storage path
-- Entities panel with type and mention count
-- Topics section
-- Related thoughts with similarity scores (toggle with L)
-- Action bar: Edit, Delete, Reclassify, Copy ID, Related, Back
-- Edit mode: TextArea replaces content, Ctrl+S saves, Esc cancels
-- Delete: confirmation dialog
-"""
+"""Read, edit, categorize, or delete a source note."""
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import (
-    Button,
-    Label,
-    ListView,
-    ListItem,
-    OptionList,
-    Static,
-    TextArea,
-)
-
-from sticky.tui.widgets.thought_row import (
-    _category_badge,
-    _confidence_dot,
-    _relative_time,
-    _CATEGORY_COLORS,
-)
-
-if TYPE_CHECKING:
-    pass
+from textual.widgets import Button, OptionList, Static, TextArea
 
 logger = logging.getLogger(__name__)
-
 CATEGORIES = ["idea", "project", "person", "meeting", "action", "reference", "journal"]
 
 
-def _confidence_color(confidence: float | None) -> str:
-    """Return color string based on confidence level."""
-    if confidence is None or confidence < 0.6:
-        return "#555555"
-    if confidence < 0.8:
-        return "#d4a843"
-    return "#4ec9b0"
-
-
 class DetailScreen(Screen):
-    """Full-screen detail view for a single thought."""
+    """All mutations use the service; failed edits retain their draft."""
 
     BINDINGS = [
-        Binding("e", "edit", "Edit", show=True, priority=True),
-        Binding("d", "delete", "Delete", show=True, priority=True),
-        Binding("c", "reclassify", "Reclassify", show=True, priority=True),
-        Binding("a", "ai_classify", "AI Classify", show=True, priority=True),
-        Binding("y", "copy_id", "Copy ID", show=True, priority=True),
-        Binding("l", "toggle_related", "Related", show=True, priority=True),
-        Binding("left", "prev_thought", "Prev", show=False, priority=True),
-        Binding("right", "next_thought", "Next", show=False, priority=True),
-        Binding("escape", "go_back", "Back", show=True, priority=True),
+        Binding("e", "edit", "Edit", show=False),
+        Binding("d", "delete", "Delete", show=False),
+        Binding("c", "category", "Category", show=False),
+        Binding("ctrl+s", "save", "Save", show=False, priority=True),
+        Binding("left", "prev_thought", "Previous", show=False),
+        Binding("right", "next_thought", "Next", show=False),
+        Binding("escape", "go_back", "Back", show=False, priority=True),
     ]
-
     DEFAULT_CSS = """
-    DetailScreen {
-        layout: vertical;
-        background: $surface;
-    }
-
-    #detail-nav-bar {
-        height: 3;
-        max-height: 3;
-        margin: 0 2;
-        align: center middle;
-        layout: horizontal;
-    }
-
-    .nav-btn {
-        min-width: 10;
-        height: 3;
-        border: none;
-        background: transparent;
-        color: $text-muted;
-    }
-
-    .nav-btn:hover {
-        background: $surface-darken-1;
-        color: $text;
-    }
-
-    #nav-label {
-        height: 3;
-        color: $text-muted;
-        content-align: center middle;
-        width: 1fr;
-    }
-
-    #detail-body {
-        height: 1fr;
-        margin: 0 1;
-        overflow-y: auto;
-    }
-
-    #detail-meta {
-        width: 30;
-        min-width: 30;
-        padding: 0 1;
-    }
-
-    .detail-section-title {
-        text-style: bold;
-        color: $text;
-        margin: 1 0 0 0;
-    }
-
-    #detail-content-area {
-        width: 1fr;
-        padding: 0 2;
-    }
-
-    #detail-content-text {
-        height: auto;
-        min-height: 3;
-    }
-
-    #detail-entities-panel {
-        width: 25;
-        min-width: 20;
-        padding: 0 1;
-    }
-
-    #detail-topics {
-        height: auto;
-        margin: 1 2 0 2;
-        color: $text-muted;
-    }
-
-    #detail-related {
-        height: auto;
-        margin: 0 2;
-        display: none;
-    }
-
-    #detail-related.visible {
-        display: block;
-    }
-
-    #detail-action-bar {
-        dock: bottom;
-        height: 3;
-        max-height: 3;
-        background: $surface-darken-1;
-        padding: 0;
-        layout: horizontal;
-    }
-
-    .action-btn {
-        min-width: 12;
-        height: 3;
-        border: none;
-        background: $surface-darken-1;
-        color: $text;
-    }
-
-    .action-btn:hover {
-        background: $accent;
-        color: $text;
-    }
-
-    .action-btn:focus {
-        background: $accent;
-    }
-
-    #detail-edit-area {
-        display: none;
-        height: auto;
-        min-height: 5;
-    }
-
-    #detail-edit-area.visible {
-        display: block;
-    }
-
-    #detail-content-text.hidden {
-        display: none;
-    }
-
-    #reclassify-overlay {
-        display: none;
-        layer: overlay;
-        width: 30;
-        height: auto;
-        margin: 2 4;
-        background: $surface;
-        border: solid $accent;
-        padding: 1;
-    }
-
-    #reclassify-overlay.visible {
-        display: block;
-    }
-
-    #delete-confirm {
-        display: none;
-        layer: overlay;
-        width: 40;
-        height: auto;
-        margin: 3 4;
-        background: $surface;
-        border: solid $error;
-        padding: 1;
-    }
-
-    #delete-confirm.visible {
-        display: block;
-    }
+    DetailScreen { layout: vertical; background: #20252b; color: #dde3e8; }
+    #detail-nav-bar { height: 3; margin: 0 1; }
+    #nav-label { width: 1fr; height: 3; content-align: center middle; }
+    #detail-body { height: 1fr; padding: 0 2; }
+    #meta-content { height: auto; margin-bottom: 1; }
+    #detail-content-text { height: auto; }
+    #detail-edit-area { display: none; height: 1fr; min-height: 5; }
+    #detail-edit-area.visible { display: block; }
+    #detail-content-text.hidden { display: none; }
+    #detail-status { height: auto; padding: 0 2; }
+    #detail-action-bar { height: 3; }
+    #category-picker { display: none; height: 9; margin: 0 2; }
+    #category-picker.visible { display: block; }
+    #delete-confirm { display: none; height: 5; margin: 0 2; }
+    #delete-confirm.visible { display: block; }
+    #delete-confirm > Horizontal { height: 3; }
+    Button { min-width: 10; }
     """
 
-    def __init__(
-        self,
-        thought_id: str,
-        context: list[str] | None = None,
-        context_index: int = 0,
-        context_label: str | None = None,
-    ) -> None:
+    def __init__(self, thought_id: str, context: list[str] | None = None, context_index: int = 0) -> None:
         super().__init__()
         self.thought_id = thought_id
         self.context = context or [thought_id]
         self.context_index = context_index
-        self.context_label = context_label
         self._thought_data: dict | None = None
-        self._entities: list[dict] = []
-        self._related: list[dict] = []
-        self._related_visible = False
         self._edit_mode = False
+        self._busy = False
+        self._read_generation = 0
 
     def compose(self) -> ComposeResult:
-        # Navigation header with clickable prev/next buttons
         with Horizontal(id="detail-nav-bar"):
-            yield Button("< prev", id="nav-prev", classes="nav-btn")
-            yield Static("", id="nav-label")
-            yield Button("next >", id="nav-next", classes="nav-btn")
-        with Horizontal(id="detail-body"):
-            with Vertical(id="detail-meta"):
-                yield Static("METADATA", classes="detail-section-title")
-                yield Static("", id="meta-content")
-            with Vertical(id="detail-content-area"):
-                yield Static("CONTENT", classes="detail-section-title")
-                yield Static("", id="detail-content-text")
-                yield TextArea(id="detail-edit-area")
-                yield Static("", id="detail-topics")
-                yield Static("", id="detail-related")
-            with Vertical(id="detail-entities-panel"):
-                yield Static("ENTITIES", classes="detail-section-title")
-                yield Static("", id="entities-content")
-        # Clickable action bar buttons
+            yield Button("← Previous", id="nav-prev")
+            yield Static("Loading note…", id="nav-label")
+            yield Button("Next →", id="nav-next")
+        with VerticalScroll(id="detail-body"):
+            yield Static("", id="meta-content", markup=False)
+            yield Static("", id="detail-content-text", markup=False)
+            yield TextArea(id="detail-edit-area")
+        yield Static("", id="detail-status", markup=False)
         with Horizontal(id="detail-action-bar"):
-            yield Button("[E] Edit", id="action-edit", classes="action-btn")
-            yield Button("[D] Del", id="action-delete", classes="action-btn")
-            yield Button("[C] Reclassify", id="action-reclassify", classes="action-btn")
-            yield Button("[A] AI Classify", id="action-ai-classify", classes="action-btn")
-            yield Button("[Y] Copy ID", id="action-copy-id", classes="action-btn")
-            yield Button("[L] Related", id="action-related", classes="action-btn")
-            yield Button("[Esc] Back", id="action-back", classes="action-btn")
-        # Overlays
-        with Vertical(id="reclassify-overlay"):
-            yield Static("Choose category:")
-            yield OptionList(
-                *CATEGORIES,
-                id="category-picker",
-            )
+            yield Button("Edit (E)", id="action-edit")
+            yield Button("Delete (D)", id="action-delete")
+            yield Button("Category (C)", id="action-category")
+            yield Button("Save (Ctrl+S)", id="action-save")
+            yield Button("Back (Esc)", id="action-back")
+        yield OptionList(*CATEGORIES, id="category-picker")
         with Vertical(id="delete-confirm"):
-            yield Static("Delete this thought permanently?")
+            yield Static("Delete this note permanently?")
             with Horizontal():
-                yield Button("Yes, delete", variant="error", id="delete-yes")
+                yield Button("Delete", variant="error", id="delete-yes")
                 yield Button("Cancel", id="delete-cancel")
 
     def on_mount(self) -> None:
-        """Load thought data on mount."""
-        self._load_thought()
+        self._set_controls()
+        self._load_thought(self.thought_id)
 
-    @work(thread=True)
-    def _load_thought(self) -> None:
-        """Load the thought and its metadata from the service."""
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "go_back":
+            return not self._busy
+        if action == "save":
+            return self._edit_mode and not self._busy
+        if self._edit_mode or self._busy:
+            return False
+        return True
+
+    def _load_thought(self, thought_id: str) -> None:
+        self._read_generation += 1
+        self._read_thought(thought_id, self._read_generation)
+
+    @work(thread=True, exclusive=True, group="detail-read")
+    def _read_thought(self, thought_id: str, generation: int) -> None:
         try:
-            svc = self.app._get_service()
-            thought = svc.db.get_thought(self.thought_id)
-            if thought is None:
-                self.app.call_from_thread(
-                    self.app.notify, "Thought not found", severity="error"
-                )
-                return
-
-            thought_data = thought.to_display()
-
-            # Get entities for this thought
-            entity_rows = svc.db.execute(
-                """SELECT e.name, e.entity_type, e.mention_count
-                   FROM entities e
-                   JOIN entity_mentions em ON em.entity_id = e.id
-                   WHERE em.thought_id = ?
-                   ORDER BY e.mention_count DESC""",
-                (self.thought_id,),
-            ).fetchall()
-            entities = [dict(row) for row in entity_rows]
-
-            # Storage path
-            thought_data["db_path"] = str(svc.config.db_path)
-
-            self.app.call_from_thread(
-                self._populate_detail, thought_data, entities
-            )
+            thought = self.app._get_service().get_thought(thought_id)
+            self.app.call_from_thread(self._populate_detail, thought, generation)
         except Exception as exc:
-            logger.warning("Failed to load thought: %s", exc)
+            logger.warning("Failed to load note: %s", exc)
+            self.app.call_from_thread(self._load_failed, thought_id, generation, str(exc))
 
-    def _populate_detail(self, thought_data: dict, entities: list[dict]) -> None:
-        """Populate all detail fields (main thread)."""
-        self._thought_data = thought_data
-        self._entities = entities
+    def _load_failed(self, thought_id: str, generation: int, error: str) -> None:
+        if self.is_mounted and thought_id == self.thought_id and generation == self._read_generation:
+            self._set_status(f"Could not load note: {error}")
 
-        # Navigation header
-        idx = self.context_index + 1
-        total = len(self.context)
-        label = self.context_label or ""
-        nav_text = f"Thought {idx} of {total}"
-        if label:
-            nav_text += f" in '{label}'"
-        try:
-            self.query_one("#nav-label", Static).update(nav_text)
-        except Exception:
-            pass
-        # Enable/disable prev/next buttons based on position
-        try:
-            prev_btn = self.query_one("#nav-prev", Button)
-            prev_btn.disabled = self.context_index <= 0
-        except Exception:
-            pass
-        try:
-            next_btn = self.query_one("#nav-next", Button)
-            next_btn.disabled = self.context_index >= len(self.context) - 1
-        except Exception:
-            pass
-
-        # Content
-        content = thought_data.get("content", "")
-        try:
-            self.query_one("#detail-content-text", Static).update(content)
-        except Exception:
-            pass
-
-        # Metadata panel
-        category = thought_data.get("category", "?")
-        confidence = thought_data.get("confidence")
-        source = thought_data.get("source", "?")
-        created = thought_data.get("created_at", "")
-        updated = thought_data.get("updated_at", "")
-        tid = thought_data.get("id", "")
-        db_path = thought_data.get("db_path", "")
-
-        conf_str = f"{confidence:.2f}" if confidence is not None else "N/A"
-        conf_color = _confidence_color(confidence)
-
-        cat_color = _CATEGORY_COLORS.get(category or "", "white")
-
-        meta_text = Text()
-        meta_text.append("Category: ")
-        meta_text.append(f" {category or '?'} ", style=f"bold {cat_color}")
-        meta_text.append(f" [{conf_str}]", style=conf_color)
-        meta_text.append(f"\nSource: {source}")
-        meta_text.append(f"\nCaptured: {_format_timestamp(created)}")
-        meta_text.append(f"\nUpdated: {_format_timestamp(updated)}")
-        meta_text.append(f"\nID: {tid}")
-        meta_text.append(f"\nStored: {db_path}")
-
-        try:
-            self.query_one("#meta-content", Static).update(meta_text)
-        except Exception:
-            pass
-
-        # Entities panel
-        if entities:
-            ent_text = Text()
-            for ent in entities:
-                name = ent.get("name", "")
-                etype = ent.get("entity_type", "")
-                count = ent.get("mention_count", 0)
-                ent_text.append(f"  {name} ")
-                ent_text.append(f"({etype})", style="dim")
-                ent_text.append(f"  {count}x\n", style="dim")
-            try:
-                self.query_one("#entities-content", Static).update(ent_text)
-            except Exception:
-                pass
-        else:
-            try:
-                self.query_one("#entities-content", Static).update(
-                    Text("(none)", style="dim")
-                )
-            except Exception:
-                pass
-
-        # Topics (from metadata)
-        metadata = thought_data.get("metadata", {})
-        topics = metadata.get("topics", [])
-        if topics:
-            topics_str = ", ".join(topics)
-            try:
-                topics_text = Text()
-                topics_text.append("TOPICS\n", style="bold")
-                topics_text.append(topics_str, style="dim")
-                self.query_one("#detail-topics", Static).update(topics_text)
-            except Exception:
-                pass
-
-    @work(thread=True)
-    def _load_related(self) -> None:
-        """Load related thoughts from the service."""
-        try:
-            svc = self.app._get_service()
-            related = svc.related_thoughts(self.thought_id, limit=3)
-            self.app.call_from_thread(self._populate_related, related)
-        except Exception as exc:
-            logger.warning("Failed to load related thoughts: %s", exc)
-
-    def _populate_related(self, related: list[dict]) -> None:
-        """Populate the related thoughts section."""
-        self._related = related
-        widget = self.query_one("#detail-related", Static)
-
-        if not related:
-            text = Text()
-            text.append("RELATED THOUGHTS\n", style="bold")
-            text.append("(no related thoughts found)", style="dim")
-            widget.update(text)
+    def _populate_detail(self, thought: dict, generation: int | None = None) -> None:
+        if not self.is_mounted or thought.get("id") != self.thought_id:
             return
+        if generation is not None and generation != self._read_generation:
+            return
+        self._thought_data = thought
+        self.query_one("#detail-content-text", Static).update(thought.get("content", ""))
+        category = thought.get("category") or "Uncategorized"
+        metadata = Text(f"{category} · {thought.get('source', '')}\n")
+        metadata.append(f"Captured: {_format_timestamp(thought.get('created_at', ''))}\n")
+        metadata.append(f"Updated: {_format_timestamp(thought.get('updated_at', ''))}\n")
+        metadata.append(f"ID: {thought.get('id', '')}")
+        if thought.get("source_url"):
+            metadata.append(f"\nSource URL: {thought['source_url']}")
+        thread = (thought.get("metadata") or {}).get("thread")
+        if thread:
+            metadata.append(f"\nThread: {thread}")
+        self.query_one("#meta-content", Static).update(metadata)
+        self.query_one("#nav-label", Static).update(f"Note {self.context_index + 1} of {len(self.context)}")
+        self._set_controls()
 
-        text = Text()
-        text.append("RELATED THOUGHTS\n", style="bold")
-        for r in related:
-            score = r.get("score", 0.0)
-            created = r.get("created_at", "")
-            content = r.get("content", "").replace("\n", " ")
-            if len(content) > 60:
-                content = content[:57] + "..."
+    def _set_status(self, message: str) -> None:
+        self.query_one("#detail-status", Static).update(message)
 
-            # Score color
-            if score >= 0.7:
-                score_color = "#4ec9b0"
-            elif score >= 0.4:
-                score_color = "#d4a843"
-            else:
-                score_color = "#e06c75"
+    def _set_controls(self) -> None:
+        for button in self.query(Button):
+            button.disabled = self._busy or self._thought_data is None
+        self.query_one("#action-back", Button).disabled = self._busy
+        for action in ("edit", "delete", "category"):
+            self.query_one(f"#action-{action}", Button).display = not self._edit_mode
+        self.query_one("#action-save", Button).display = self._edit_mode
+        self.query_one("#nav-prev", Button).disabled = self._busy or self._edit_mode or self.context_index <= 0
+        self.query_one("#nav-next", Button).disabled = self._busy or self._edit_mode or self.context_index >= len(self.context) - 1
+        self.query_one(TextArea).disabled = self._busy
 
-            text.append(f"[{score:.2f}]", style=score_color)
-            text.append(f" {_relative_time(created).ljust(8)}", style="dim")
-            text.append(f' "{content}"\n')
-
-        widget.update(text)
-
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
+    def _close_overlays(self) -> None:
+        self.query_one("#delete-confirm").remove_class("visible")
+        self.query_one("#category-picker").remove_class("visible")
 
     def action_go_back(self) -> None:
-        """Pop this screen and return."""
+        if self._busy:
+            return
         if self._edit_mode:
             self._exit_edit_mode()
-            return
-        # Hide overlays if open
-        try:
-            reclass = self.query_one("#reclassify-overlay")
-            if "visible" in reclass.classes:
-                reclass.remove_class("visible")
-                return
-        except Exception:
-            pass
-        try:
-            confirm = self.query_one("#delete-confirm")
-            if "visible" in confirm.classes:
-                confirm.remove_class("visible")
-                return
-        except Exception:
-            pass
-        self.dismiss(self._thought_data)
+        elif self.query(".visible"):
+            self._close_overlays()
+            self.query_one("#action-edit", Button).focus()
+        else:
+            self.dismiss(self._thought_data)
 
     def action_edit(self) -> None:
-        """Enter edit mode: replace content Static with TextArea."""
-        if self._edit_mode or self._thought_data is None:
+        if self._busy or self._edit_mode or self._thought_data is None:
             return
+        self._close_overlays()
         self._edit_mode = True
-        content = self._thought_data.get("content", "")
-
-        try:
-            edit_area = self.query_one("#detail-edit-area", TextArea)
-            edit_area.load_text(content)
-            edit_area.add_class("visible")
-            edit_area.focus()
-
-            content_static = self.query_one("#detail-content-text", Static)
-            content_static.add_class("hidden")
-
-            # Hide action bar buttons and show edit-mode hint
-            self._set_action_bar_edit_mode(True)
-        except Exception as exc:
-            logger.warning("Failed to enter edit mode: %s", exc)
+        editor = self.query_one(TextArea)
+        editor.load_text(self._thought_data.get("content", ""))
+        editor.add_class("visible")
+        self.query_one("#detail-content-text").add_class("hidden")
+        self._set_status("Ctrl+S saves. Escape cancels the edit.")
+        self._set_controls()
+        editor.focus()
 
     def _exit_edit_mode(self) -> None:
-        """Exit edit mode without saving."""
         self._edit_mode = False
-        try:
-            edit_area = self.query_one("#detail-edit-area", TextArea)
-            edit_area.remove_class("visible")
+        self.query_one(TextArea).remove_class("visible")
+        self.query_one("#detail-content-text").remove_class("hidden")
+        self._set_status("")
+        self._set_controls()
+        self.query_one("#action-edit", Button).focus()
 
-            content_static = self.query_one("#detail-content-text", Static)
-            content_static.remove_class("hidden")
-
-            # Restore action bar buttons
-            self._set_action_bar_edit_mode(False)
-        except Exception:
-            pass
-
-    def _set_action_bar_edit_mode(self, editing: bool) -> None:
-        """Toggle action bar between edit mode and normal mode."""
-        try:
-            action_btn_ids = [
-                "action-edit", "action-delete", "action-reclassify",
-                "action-ai-classify", "action-copy-id", "action-related",
-                "action-back",
-            ]
-            for btn_id in action_btn_ids:
-                try:
-                    btn = self.query_one(f"#{btn_id}", Button)
-                    btn.display = not editing
-                except Exception:
-                    pass
-            # In edit mode, show a save/cancel hint via a static if needed
-            # The TextArea itself handles Ctrl+S via on_key and Esc via action_go_back
-        except Exception:
-            pass
-
-    def on_key(self, event) -> None:
-        """Handle key events directly as fallback for bindings."""
-        if self._edit_mode:
-            if event.key == "ctrl+s":
-                event.prevent_default()
-                self._save_edit()
+    def action_save(self) -> None:
+        if not self._edit_mode or self._busy:
             return
-        # Fallback key handling in case bindings don't fire
-        key_action_map = {
-            "e": self.action_edit,
-            "d": self.action_delete,
-            "c": self.action_reclassify,
-            "a": self.action_ai_classify,
-            "y": self.action_copy_id,
-            "l": self.action_toggle_related,
-            "left": self.action_prev_thought,
-            "right": self.action_next_thought,
-        }
-        action = key_action_map.get(event.key)
-        if action is not None:
-            event.prevent_default()
-            action()
-
-    def _save_edit(self) -> None:
-        """Save edited content."""
-        try:
-            edit_area = self.query_one("#detail-edit-area", TextArea)
-            new_content = edit_area.text
-        except Exception:
+        content = self.query_one(TextArea).text
+        if not content.strip():
+            self._set_status("A note cannot be empty. Enter text before saving.")
             return
-
-        if not new_content.strip():
-            self.app.notify("Content cannot be empty", severity="error")
-            return
-
-        self._exit_edit_mode()
-        self._do_update(new_content.strip())
-
-    @work(thread=True)
-    def _do_update(self, content: str) -> None:
-        """Update the thought content via service."""
-        try:
-            svc = self.app._get_service()
-            result = svc.update(self.thought_id, content)
-            self.app.call_from_thread(self.app.notify, "Thought updated!")
-            # Reload
-            self.app.call_from_thread(self._load_thought)
-        except Exception as exc:
-            logger.warning("Update failed: %s", exc)
-            self.app.call_from_thread(
-                self.app.notify, f"Update failed: {exc}", severity="error"
-            )
+        self._begin_mutation("Saving…")
+        self._mutate("update", content)
 
     def action_delete(self) -> None:
-        """Show delete confirmation dialog."""
-        if self._edit_mode:
+        if self._busy or self._edit_mode or self._thought_data is None:
             return
+        self._close_overlays()
+        self.query_one("#delete-confirm").add_class("visible")
+        self.query_one("#delete-cancel", Button).focus()
+
+    def action_category(self) -> None:
+        if self._busy or self._edit_mode or self._thought_data is None:
+            return
+        self._close_overlays()
+        picker = self.query_one(OptionList)
+        picker.add_class("visible")
+        picker.focus()
+
+    def _begin_mutation(self, message: str) -> None:
+        self._busy = True
+        self._set_status(message)
+        self._set_controls()
+
+    @work(thread=True)
+    def _mutate(self, operation: str, value: str | None = None) -> None:
         try:
-            self.query_one("#delete-confirm").add_class("visible")
-        except Exception:
-            pass
+            svc = self.app._get_service()
+            if operation == "delete":
+                svc.delete(self.thought_id)
+                result = None
+            elif operation == "update":
+                result = svc.update(self.thought_id, value)
+            else:
+                result = svc.classify_thought(self.thought_id, value)
+        except Exception as exc:
+            logger.warning("%s failed: %s", operation, exc)
+            self.app.call_from_thread(self._mutation_failed, operation, str(exc))
+        else:
+            self.app.call_from_thread(self._mutation_finished, operation, result)
+
+    def _mutation_failed(self, operation: str, error: str) -> None:
+        self._busy = False
+        self._set_controls()
+        recovery = "Your edit is retained; retry or cancel." if self._edit_mode else "Retry or cancel."
+        self._set_status(f"{operation.capitalize()} failed: {error}. {recovery}")
+        if self._edit_mode:
+            self.query_one(TextArea).focus()
+
+    def _mutation_finished(self, operation: str, result: dict | None) -> None:
+        self._busy = False
+        if operation == "delete":
+            self.dismiss(None)
+            return
+        self._close_overlays()
+        if self._edit_mode:
+            self._exit_edit_mode()
+        self._populate_detail(result)
+        self._set_status("Note saved." if operation == "update" else "Category saved.")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle button presses in overlays and action bar."""
-        btn_id = event.button.id
-        if btn_id == "delete-yes":
-            self._do_delete()
-        elif btn_id == "delete-cancel":
-            try:
-                self.query_one("#delete-confirm").remove_class("visible")
-            except Exception:
-                pass
-        # Action bar buttons
-        elif btn_id == "action-edit":
-            self.action_edit()
-        elif btn_id == "action-delete":
-            self.action_delete()
-        elif btn_id == "action-reclassify":
-            self.action_reclassify()
-        elif btn_id == "action-ai-classify":
-            self.action_ai_classify()
-        elif btn_id == "action-copy-id":
-            self.action_copy_id()
-        elif btn_id == "action-related":
-            self.action_toggle_related()
-        elif btn_id == "action-back":
-            self.action_go_back()
-        # Navigation buttons
-        elif btn_id == "nav-prev":
-            self.action_prev_thought()
-        elif btn_id == "nav-next":
-            self.action_next_thought()
-
-    @work(thread=True)
-    def _do_delete(self) -> None:
-        """Delete the thought via service."""
-        try:
-            svc = self.app._get_service()
-            svc.delete(self.thought_id)
-            self.app.call_from_thread(
-                self.app.notify, "Thought deleted", severity="information"
-            )
-            self.app.call_from_thread(self.dismiss, None)
-        except Exception as exc:
-            logger.warning("Delete failed: %s", exc)
-            self.app.call_from_thread(
-                self.app.notify, f"Delete failed: {exc}", severity="error"
-            )
-
-    def action_reclassify(self) -> None:
-        """Show the category picker overlay."""
-        if self._edit_mode:
-            return
-        try:
-            self.query_one("#reclassify-overlay").add_class("visible")
-            self.query_one("#category-picker", OptionList).focus()
-        except Exception:
-            pass
+        event.stop()
+        button_id = event.button.id
+        if button_id == "delete-yes":
+            self._begin_mutation("Deleting…")
+            self._mutate("delete")
+        elif button_id == "delete-cancel":
+            self._close_overlays()
+            self.query_one("#action-edit", Button).focus()
+        else:
+            actions = {
+                "action-edit": self.action_edit,
+                "action-delete": self.action_delete,
+                "action-category": self.action_category,
+                "action-save": self.action_save,
+                "action-back": self.action_go_back,
+                "nav-prev": self.action_prev_thought,
+                "nav-next": self.action_next_thought,
+            }
+            action = actions.get(button_id)
+            if action:
+                action()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        """Handle category selection from the picker."""
-        category = str(event.option.prompt)
-        try:
-            self.query_one("#reclassify-overlay").remove_class("visible")
-        except Exception:
-            pass
-        self._do_reclassify(category)
+        self._close_overlays()
+        self._begin_mutation("Saving category…")
+        self._mutate("category", str(event.option.prompt))
 
-    @work(thread=True)
-    def _do_reclassify(self, category: str) -> None:
-        """Reclassify the thought via service."""
-        try:
-            svc = self.app._get_service()
-            svc.classify_thought(self.thought_id, category)
-            self.app.call_from_thread(
-                self.app.notify,
-                f"Reclassified as '{category}'",
-                severity="information",
-            )
-            self.app.call_from_thread(self._load_thought)
-        except Exception as exc:
-            logger.warning("Reclassify failed: %s", exc)
-            self.app.call_from_thread(
-                self.app.notify, f"Reclassify failed: {exc}", severity="error"
-            )
-
-    def action_ai_classify(self) -> None:
-        """Re-run AI classification on this thought."""
-        if self._edit_mode or self._thought_data is None:
+    def _navigate(self, index: int) -> None:
+        if self._busy or self._edit_mode or not 0 <= index < len(self.context):
             return
-        self.app.notify("Running AI classification...", severity="information")
-        self._do_ai_classify()
-
-    @work(thread=True)
-    def _do_ai_classify(self) -> None:
-        """Re-classify the thought using the LLM."""
-        try:
-            svc = self.app._get_service()
-            content = self._thought_data.get("content", "")
-            template = (self._thought_data.get("metadata") or {}).get("template")
-
-            classification = svc.classifier.classify_sync(content, template)
-            if classification is None:
-                self.app.call_from_thread(
-                    self.app.notify,
-                    "AI classification failed — check OpenRouter API key",
-                    severity="error",
-                )
-                return
-
-            # Update the thought with AI results
-            metadata = {
-                "topics": classification.topics,
-                "people": classification.people,
-                "projects": classification.projects,
-                "actions": classification.actions,
-            }
-            if template:
-                metadata["template"] = template
-
-            svc.db.update_thought(
-                self.thought_id,
-                category=classification.category,
-                confidence=classification.confidence,
-                needs_review=classification.confidence < svc.config.confidence_threshold,
-                metadata=metadata,
-            )
-
-            # Re-resolve entities
-            svc.db.delete_mentions_for_thought(self.thought_id)
-            entities = svc.entity_resolver.resolve_entities(
-                classification, self.thought_id,
-            )
-
-            self.app.call_from_thread(
-                self.app.notify,
-                f"AI classified as '{classification.category}' "
-                f"({classification.confidence:.0%} confidence)",
-                severity="information",
-            )
-            self.app.call_from_thread(self._load_thought)
-        except Exception as exc:
-            logger.warning("AI classification failed: %s", exc)
-            self.app.call_from_thread(
-                self.app.notify, f"AI classify failed: {exc}", severity="error"
-            )
-
-    def action_copy_id(self) -> None:
-        """Copy the thought ULID to clipboard."""
-        if self._thought_data is None:
-            return
-        tid = self._thought_data.get("id", "")
-        try:
-            import pyperclip
-
-            pyperclip.copy(tid)
-            self.app.notify(f"Copied: {tid}", severity="information")
-        except ImportError:
-            # Fallback: just notify
-            self.app.notify(
-                f"ID: {tid} (pyperclip not installed for clipboard)",
-                severity="warning",
-            )
-
-    def action_toggle_related(self) -> None:
-        """Toggle the related thoughts section."""
-        if self._edit_mode:
-            return
-        self._related_visible = not self._related_visible
-        try:
-            widget = self.query_one("#detail-related", Static)
-            if self._related_visible:
-                widget.add_class("visible")
-                if not self._related:
-                    self._load_related()
-            else:
-                widget.remove_class("visible")
-        except Exception:
-            pass
+        self._close_overlays()
+        self.context_index = index
+        self.thought_id = self.context[index]
+        self._thought_data = None
+        self.query_one("#detail-content-text", Static).update("")
+        self.query_one("#meta-content", Static).update("")
+        self.query_one("#nav-label", Static).update("Loading note…")
+        self._set_status("")
+        self._set_controls()
+        self._load_thought(self.thought_id)
 
     def action_prev_thought(self) -> None:
-        """Navigate to the previous thought in context."""
-        if self.context_index > 0:
-            self.context_index -= 1
-            self.thought_id = self.context[self.context_index]
-            self._related = []
-            self._related_visible = False
-            try:
-                self.query_one("#detail-related", Static).remove_class("visible")
-            except Exception:
-                pass
-            self._load_thought()
+        self._navigate(self.context_index - 1)
 
     def action_next_thought(self) -> None:
-        """Navigate to the next thought in context."""
-        if self.context_index < len(self.context) - 1:
-            self.context_index += 1
-            self.thought_id = self.context[self.context_index]
-            self._related = []
-            self._related_visible = False
-            try:
-                self.query_one("#detail-related", Static).remove_class("visible")
-            except Exception:
-                pass
-            self._load_thought()
+        self._navigate(self.context_index + 1)
 
 
-def _format_timestamp(ts: str) -> str:
-    """Format ISO timestamp for display."""
-    if not ts:
-        return "N/A"
+def _format_timestamp(timestamp: str) -> str:
+    from datetime import datetime
+
     try:
-        from datetime import datetime, timezone
-
-        dt = datetime.fromisoformat(ts)
-        return dt.strftime("%b %d, %Y %I:%M%p")
+        return datetime.fromisoformat(timestamp).astimezone().strftime("%b %d, %Y %I:%M%p %Z")
     except (ValueError, TypeError):
-        return ts
+        return timestamp

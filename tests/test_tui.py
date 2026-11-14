@@ -1,852 +1,768 @@
-"""Tests for the sticky TUI application.
-
-Uses Textual's async test framework (AppTest / run_test).
-"""
+"""Pilot regressions for the small capture/find/edit terminal surface."""
 
 from __future__ import annotations
 
-import pytest
+import asyncio
+import struct
+import threading
 
+import httpx
+import pytest
+from textual.widgets import Input, OptionList, Static, TabbedContent, TabPane, Tabs, TextArea
+
+from sticky.core.embeddings import EmbeddingEngine
+from sticky.core.models import Thought
+from sticky.core.service import StickyService
 from sticky.tui.app import StickyApp
 from sticky.tui.views.detail import DetailScreen
-from sticky.tui.views.digest_view import DigestContent, DigestView, PeriodSelector, PeriodTab
-from sticky.tui.views.entities_view import (
-    EntityDetail,
-    EntityList,
-    EntityRow,
-    EntitiesView,
-    PinnedContext,
-    TypeFilter,
-)
-from sticky.tui.views.command_palette import CommandItem, CommandPalette
-from sticky.tui.views.home import DigestBanner, FilterBar, HomeView, ThoughtList
-from sticky.tui.views.review import ReviewItem, ReviewList, ReviewView
-from sticky.tui.views.search_view import (
-    SearchFilterBar,
-    SearchModeIndicator,
-    SearchResultRow,
-    SearchResultsList,
-    SearchView,
-)
+from sticky.tui.views.home import HomeView, ThoughtList
+from sticky.tui.views.search_view import SearchResultsList, SearchView
 from sticky.tui.widgets.capture_input import CaptureInput
-from sticky.tui.widgets.keybinding_legend import KeybindingLegend
 from sticky.tui.widgets.status_bar import StatusBar
-from sticky.tui.widgets.thought_row import (
-    ThoughtRow,
-    _category_badge,
-    _confidence_dot,
-    _relative_time,
-)
+from sticky.tui.widgets.thought_row import _category_badge, _relative_time
 
 
-# ---------------------------------------------------------------------------
-# Unit tests for helper functions
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def tui_environment(env_override, tmp_path, monkeypatch):
+    """Use real service/SQLite with cheap vectors and fail on any cloud call."""
+    import sticky.core.config as config
+
+    monkeypatch.setattr(config, "_default_config_dir", lambda: tmp_path / "config")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    calls = {"embeddings": 0, "cloud": 0}
+
+    def embed(engine, text):
+        calls["embeddings"] += 1
+        return struct.pack("384f", 1.0, *([0.0] * 383))
+
+    def cloud(*args, **kwargs):
+        calls["cloud"] += 1
+        raise AssertionError("TUI must not call a cloud model")
+
+    async def async_cloud(*args, **kwargs):
+        return cloud(*args, **kwargs)
+
+    monkeypatch.setattr(EmbeddingEngine, "embed", embed)
+    monkeypatch.setattr(httpx.Client, "post", cloud)
+    monkeypatch.setattr(httpx.AsyncClient, "post", async_cloud)
+    return calls
 
 
-class TestConfidenceDot:
-    """Test confidence dot formatting."""
-
-    def test_high_confidence(self):
-        dot = _confidence_dot(0.9)
-        assert "\u25cf" in dot.plain  # filled circle (green)
-
-    def test_medium_confidence(self):
-        dot = _confidence_dot(0.7)
-        assert "\u25cf" in dot.plain  # filled circle
-
-    def test_low_confidence(self):
-        dot = _confidence_dot(0.3)
-        assert "\u25cb" in dot.plain  # hollow circle
-
-    def test_none_confidence(self):
-        dot = _confidence_dot(None)
-        assert "\u25cb" in dot.plain  # hollow circle
+async def settled(app, pilot):
+    """Flush events, then wait for the actual workers and their callbacks."""
+    await pilot.pause()
+    await app.workers.wait_for_complete()
+    await pilot.pause()
 
 
-class TestCategoryBadge:
-    """Test category badge formatting."""
-
-    def test_idea_badge(self):
-        badge = _category_badge("idea")
-        assert "idea" in badge.plain
-
-    def test_person_badge(self):
-        badge = _category_badge("person")
-        assert "person" in badge.plain
-
-    def test_none_badge(self):
-        badge = _category_badge(None)
-        assert "?" in badge.plain
+async def worker_started(event):
+    assert await asyncio.to_thread(event.wait, 3), "worker did not reach its controlled gate"
 
 
-class TestRelativeTime:
-    """Test relative time formatting."""
-
-    def test_recent_timestamp(self):
-        from datetime import datetime, timezone
-
-        now = datetime.now(timezone.utc)
-        result = _relative_time(now.isoformat())
-        assert result in ("just now", "0m ago", "1m ago")
-
-    def test_invalid_timestamp(self):
-        result = _relative_time("not-a-date")
-        assert result == ""
-
-    def test_empty_timestamp(self):
-        result = _relative_time("")
-        assert result == ""
+async def wait_until(pilot, predicate, description):
+    """Wait for an actual UI state without changing Textual's native timers."""
+    deadline = asyncio.get_running_loop().time() + 3
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, description
+        await pilot.pause(0.01)
 
 
-# ---------------------------------------------------------------------------
-# App-level tests
-# ---------------------------------------------------------------------------
+def insert_note(app, content="Meeting at 2 pm [keep this literally]"):
+    thought = Thought.create(content=content, category="meeting", source="test")
+    app._get_service().db.insert_thought(thought)
+    return thought
+
+
+async def open_note(app, pilot, thought):
+    app.push_screen(DetailScreen(thought.id, [thought.id]), callback=app._on_detail_dismissed)
+    await settled(app, pilot)
+    return app.screen
 
 
 @pytest.mark.asyncio
-async def test_app_launches():
-    """Verify the app launches and has the correct title."""
+async def test_startup_is_local_and_only_mounts_three_tabs(tui_environment):
     app = StickyApp()
     async with app.run_test(size=(120, 30)) as pilot:
-        assert pilot.app.title == "sticky"
+        await settled(app, pilot)
+        assert app.title == "sticky"
+        assert {pane.id for pane in app.query(TabPane)} == {"home", "search", "about"}
+        assert app.query_one(TabbedContent).active == "home"
+        assert app.focused is app.query_one(CaptureInput)
+        assert not list(app.query("#digest-banner, #search-mode, #search-filter-bar, #more-btn"))
+        assert tui_environment == {"embeddings": 0, "cloud": 0}
 
 
 @pytest.mark.asyncio
-async def test_capture_input_visible():
-    """Verify the capture input is rendered on the home view."""
+async def test_populated_startup_does_not_generate_or_embed(tui_environment):
+    app = StickyApp()
+    insert_note(app)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        assert len(app.query_one(ThoughtList).children) == 1
+        assert app.query_one(StatusBar).thought_count == 1
+        assert tui_environment == {"embeddings": 0, "cloud": 0}
+
+
+@pytest.mark.asyncio
+async def test_failed_capture_retains_exact_draft_and_successful_retry(tui_environment, monkeypatch):
+    original = StickyService.capture
+
+    def fail(*args, **kwargs):
+        raise OSError("disk write failure")
+
+    monkeypatch.setattr(StickyService, "capture", fail)
     app = StickyApp()
     async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        input_widget = pilot.app.query_one("#capture-input", CaptureInput)
-        assert input_widget is not None
+        await settled(app, pilot)
+        inp = app.query_one(CaptureInput)
+        draft = "    return \"保留 👩🏽‍💻 [literal]\"    "
+        inp.value = draft
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert inp.value == draft
+        assert not inp.disabled
+        assert app.focused is inp
+        assert app._get_service().db.get_stats()["thoughts"]["total"] == 0
+        assert "disk write failure" in str(app.query_one("#capture-status", Static).render())
+        monkeypatch.setattr(StickyService, "capture", original)
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert inp.value == ""
+        notes = app._get_service().list_thoughts()["thoughts"]
+        assert len(notes) == 1
+        assert notes[0]["content"] == draft
+        assert len(app.query_one(ThoughtList).children) == 1
+        assert app.query_one(StatusBar).thought_count == 1
+        assert "Note saved" in str(app.query_one("#capture-status", Static).render())
+        assert tui_environment["cloud"] == 0
 
 
 @pytest.mark.asyncio
-async def test_status_bar_present():
-    """Verify the status bar is rendered at the bottom."""
+async def test_capture_blocks_second_submit_until_persisted(tui_environment, monkeypatch):
+    original = StickyService.capture
+    started = threading.Event()
+    release = threading.Event()
+    submitted = []
+
+    def slow_capture(self, *args, **kwargs):
+        submitted.append(kwargs["content"])
+        started.set()
+        assert release.wait(10), "test did not release capture"
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(StickyService, "capture", slow_capture)
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        bar = pilot.app.query_one("#status-bar", StatusBar)
-        assert bar is not None
-        # StatusBar is a container; check the #status-text child and More button
-        from textual.widgets import Static, Button
-        status_text = bar.query_one("#status-text", Static)
-        assert status_text is not None
-        more_btn = bar.query_one("#more-btn", Button)
-        assert more_btn is not None
+    try:
+        async with app.run_test(size=(120, 30)) as pilot:
+            await settled(app, pilot)
+            inp = app.query_one(CaptureInput)
+            inp.value = "Save only once"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert started.is_set()
+            assert inp.disabled
+            assert inp.value == "Save only once"
+            await pilot.press("enter")
+            assert len(submitted) == 1
+            release.set()
+            await settled(app, pilot)
+            assert app._get_service().db.get_stats()["thoughts"]["total"] == 1
+            assert inp.value == ""
+            assert not inp.disabled
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
-async def test_keybinding_legend_present():
-    """Verify the keybinding legend is rendered."""
+async def test_search_uses_default_behavior_and_escape_returns_home(tui_environment, monkeypatch):
+    observed = []
+    original = StickyService.search
+
+    def search(self, **kwargs):
+        observed.append(kwargs)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(StickyService, "search", search)
     app = StickyApp()
+    thought = insert_note(app, "Passport expires in December")
     async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        await pilot.press("ctrl+f")
         await pilot.pause()
-        legend = pilot.app.query_one("#keybinding-legend", KeybindingLegend)
-        assert legend is not None
+        inp = app.query_one("#search-input", Input)
+        assert app.focused is inp
+        inp.value = "Passport"
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert observed == [{"query": "Passport"}]
+        result_list = app.query_one(SearchResultsList)
+        assert [child.result["id"] for child in result_list.children] == [thought.id]
+        result_list.focus()
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert isinstance(app.screen, DetailScreen)
+        await pilot.press("escape")
+        await settled(app, pilot)
+        assert app.query_one(TabbedContent).active == "search"
+        await pilot.press("escape")
+        await settled(app, pilot)
+        assert app.query_one(TabbedContent).active == "home"
+        assert app.focused is app.query_one(CaptureInput)
+        assert tui_environment["cloud"] == 0
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(reason="focus timing is non-deterministic in test runner")
-async def test_keybinding_legend_context_changes():
-    """Verify the legend changes context based on focus."""
+async def test_search_clear_is_working_control(tui_environment):
     app = StickyApp()
+    insert_note(app, "Passport expires in December")
     async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        await pilot.press("ctrl+f")
         await pilot.pause()
-        legend = pilot.app.query_one("#keybinding-legend", KeybindingLegend)
-
-        # Initially should be capture context (capture input is focused)
-        assert legend.context == "capture"
-
-        # Focus the search input
-        search_input = pilot.app.query_one("#search-input")
-        search_input.focus()
-        await pilot.pause()
-        assert legend.context == "search"
+        app.query_one("#search-input", Input).value = "Passport"
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert len(app.query_one(SearchResultsList).children) == 1
+        await pilot.click("#search-clear")
+        await settled(app, pilot)
+        assert app.query_one("#search-input", Input).value == ""
+        assert not app.query_one(SearchResultsList).children
 
 
 @pytest.mark.asyncio
-async def test_home_view_has_thought_list():
-    """Verify the home view contains a thought list."""
+async def test_deferred_focus_cannot_reopen_inactive_tab(tui_environment):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        thought_list = pilot.app.query_one("#thought-list", ThoughtList)
-        assert thought_list is not None
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        await pilot.press("ctrl+f")
+        await wait_until(pilot, lambda: app.query_one(TabbedContent).active == "search" and app.focused is app.query_one("#search-input", Input), "Search navigation did not complete")
+        app._focus_home_input()  # A delayed startup callback must not steal focus.
+        await settled(app, pilot)
+        assert app.query_one(TabbedContent).active == "search"
+        assert app.focused is app.query_one("#search-input", Input)
+        await pilot.press("escape")
+        await wait_until(pilot, lambda: app.query_one(TabbedContent).active == "home" and app.focused is app.query_one(CaptureInput), "Escape navigation did not complete")
+        app._focus_search_input()  # A delayed Search callback must not reopen it.
+        await settled(app, pilot)
+        assert app.query_one(TabbedContent).active == "home"
+        assert app.focused is app.query_one(CaptureInput)
 
 
 @pytest.mark.asyncio
-async def test_home_view_has_digest_banner():
-    """Verify the home view contains a digest banner."""
+async def test_about_stays_visible_after_search(tui_environment):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        banner = pilot.app.query_one("#digest-banner", DigestBanner)
-        assert banner is not None
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        await pilot.press("ctrl+f")
+        await pilot.click("#--content-tab-about")
+        await settled(app, pilot)
+        assert app.query_one(TabbedContent).active == "about"
+        assert app.query_one("#about-info").is_on_screen
+        await pilot.press("escape")
+        await settled(app, pilot)
+        assert app.query_one(TabbedContent).active == "home"
 
 
 @pytest.mark.asyncio
-async def test_search_view_has_mode_indicator():
-    """Verify the search view has a search mode indicator."""
+async def test_home_list_opens_literal_content_in_detail(tui_environment):
     app = StickyApp()
+    thought = insert_note(app)
     async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        mode = pilot.app.query_one("#search-mode", SearchModeIndicator)
-        assert mode is not None
-        assert mode.mode == "hybrid"
-
-
-@pytest.mark.asyncio
-async def test_search_mode_cycle():
-    """Verify the search mode cycles correctly."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        mode = pilot.app.query_one("#search-mode", SearchModeIndicator)
-        assert mode.mode == "hybrid"
-
-        new = mode.cycle_mode()
-        assert new == "vector"
-
-        new = mode.cycle_mode()
-        assert new == "fts"
-
-        new = mode.cycle_mode()
-        assert new == "hybrid"
-
-
-@pytest.mark.asyncio
-async def test_search_results_list_present():
-    """Verify the search results list is rendered."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        results = pilot.app.query_one("#search-results", SearchResultsList)
-        assert results is not None
-
-
-@pytest.mark.asyncio
-async def test_tabs_present():
-    """Verify all six tabs are present."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        tabs = pilot.app.query_one("#tabs")
-        assert tabs is not None
-        # Check tab panes exist by ID
-        for tab_id in ("home", "search", "review", "entities", "digest", "stats"):
-            pane = pilot.app.query_one(f"#{tab_id}")
-            assert pane is not None, f"Tab pane '{tab_id}' not found"
-
-
-@pytest.mark.asyncio
-@pytest.mark.xfail(reason="reactive update timing is non-deterministic in test runner")
-async def test_status_bar_update():
-    """Verify the status bar can be updated."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        bar = pilot.app.query_one("#status-bar", StatusBar)
-        bar.update_stats(42, 3, "local", "cloud")
-        await pilot.pause()
-        assert bar.thought_count == 42
-        assert bar.review_count == 3
-
-
-@pytest.mark.asyncio
-async def test_filter_bar_hidden_by_default():
-    """Verify the filter bar is hidden by default on home view."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        filter_bar = pilot.app.query_one(FilterBar)
-        assert "visible" not in filter_bar.classes
-
-
-@pytest.mark.asyncio
-async def test_thought_row_compose():
-    """Verify ThoughtRow can compose with thought data."""
-    thought = {
-        "id": "test123",
-        "content": "Test thought content",
-        "category": "idea",
-        "confidence": 0.9,
-        "created_at": "2025-01-01T00:00:00+00:00",
-    }
-    row = ThoughtRow(thought)
-    assert row.thought == thought
-
-
-# ---------------------------------------------------------------------------
-# Detail screen tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_detail_screen_renders():
-    """Verify the detail screen renders with thought content visible."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-
-        # Capture a thought so we have data
-        svc = app._get_service()
-        svc.db.initialize()
-        from sticky.core.models import Thought
-
-        thought = Thought.create(
-            content="Detail test thought content",
-            category="idea",
-            confidence=0.85,
-            source="test",
-        )
-        svc.db.insert_thought(thought)
-
-        # Push detail screen
-        app.push_screen(
-            DetailScreen(
-                thought_id=thought.id,
-                context=[thought.id],
-                context_index=0,
-            )
-        )
-        # Allow workers to complete
-        await pilot.pause()
-        await pilot.pause()
-
-        # The detail screen is now the active screen
+        await settled(app, pilot)
+        app.query_one(ThoughtList).focus()
+        await pilot.press("enter")
+        await settled(app, pilot)
         screen = app.screen
         assert isinstance(screen, DetailScreen)
-
-        # Verify key widgets exist on the screen
-        content_widget = screen.query_one("#detail-content-text")
-        assert content_widget is not None
-
-        meta_widget = screen.query_one("#meta-content")
-        assert meta_widget is not None
-
-        nav_widget = screen.query_one("#detail-nav-bar")
-        assert nav_widget is not None
+        assert screen._thought_data["id"] == thought.id
+        assert "[keep this literally]" in str(screen.query_one("#detail-content-text", Static).render())
+        assert not list(screen.query("#action-ai-classify, #detail-related, #entities-content"))
 
 
 @pytest.mark.asyncio
-async def test_detail_screen_action_bar():
-    """Verify the detail screen has the action bar."""
+async def test_edit_typing_shortcut_letters_and_save(tui_environment):
     app = StickyApp()
+    thought = insert_note(app, "Original note")
     async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
+        await settled(app, pilot)
+        screen = await open_note(app, pilot, thought)
+        await pilot.press("e")
+        editor = screen.query_one(TextArea)
+        editor.load_text("")
+        await pilot.press("e", "d", "c", "a", "l", "y")
+        assert editor.text == "edcaly"
+        await pilot.press("ctrl+s")
+        await settled(app, pilot)
+        assert app._get_service().db.get_thought(thought.id).content == "edcaly"
+        assert not screen._edit_mode
+        assert tui_environment["cloud"] == 0
 
-        svc = app._get_service()
-        svc.db.initialize()
-        from sticky.core.models import Thought
 
-        thought = Thought.create(
-            content="Action bar test thought",
-            category="project",
-            confidence=0.9,
-            source="test",
-        )
-        svc.db.insert_thought(thought)
+@pytest.mark.asyncio
+async def test_edit_escape_cancels_without_changing_saved_note(tui_environment):
+    app = StickyApp()
+    thought = insert_note(app, "Original note")
+    async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        screen = await open_note(app, pilot, thought)
+        await pilot.press("e")
+        screen.query_one(TextArea).load_text("Unsaved edit")
+        await pilot.press("escape")
+        assert not screen._edit_mode
+        assert app._get_service().db.get_thought(thought.id).content == "Original note"
+        assert isinstance(app.screen, DetailScreen)
+        await pilot.press("escape")
+        assert not isinstance(app.screen, DetailScreen)
 
-        app.push_screen(
-            DetailScreen(thought_id=thought.id)
-        )
-        await pilot.pause()
 
+@pytest.mark.asyncio
+async def test_failed_edit_retains_draft_until_retry(tui_environment, monkeypatch):
+    original = StickyService.update
+
+    def fail(*args, **kwargs):
+        raise OSError("update write failed")
+
+    monkeypatch.setattr(StickyService, "update", fail)
+    app = StickyApp()
+    thought = insert_note(app, "Original note")
+    async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        screen = await open_note(app, pilot, thought)
+        await pilot.press("e")
+        screen.query_one(TextArea).load_text("Changed note")
+        await pilot.press("ctrl+s")
+        await settled(app, pilot)
+        assert screen._edit_mode
+        assert screen.query_one(TextArea).text == "Changed note"
+        assert not screen.query_one(TextArea).disabled
+        assert app._get_service().db.get_thought(thought.id).content == "Original note"
+        monkeypatch.setattr(StickyService, "update", original)
+        await pilot.press("ctrl+s")
+        await settled(app, pilot)
+        assert app._get_service().db.get_thought(thought.id).content == "Changed note"
+
+
+@pytest.mark.asyncio
+async def test_manual_category_uses_service_without_cloud(tui_environment):
+    app = StickyApp()
+    thought = insert_note(app)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        screen = await open_note(app, pilot, thought)
+        await pilot.press("c")
+        picker = screen.query_one(OptionList)
+        assert app.focused is picker
+        picker.highlighted = 0
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert app._get_service().db.get_thought(thought.id).category == "idea"
+        assert tui_environment["cloud"] == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_requires_confirmation_and_cancel_preserves_note(tui_environment):
+    app = StickyApp()
+    thought = insert_note(app)
+    async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        screen = await open_note(app, pilot, thought)
+        await pilot.press("d")
+        assert "visible" in screen.query_one("#delete-confirm").classes
+        await pilot.press("escape")
+        assert app._get_service().db.get_thought(thought.id) is not None
+        await pilot.press("d")
+        await pilot.click("#delete-yes")
+        await settled(app, pilot)
+        assert app._get_service().db.get_thought(thought.id) is None
+        assert not isinstance(app.screen, DetailScreen)
+        assert not app.query_one(ThoughtList).children
+        assert app.query_one(StatusBar).thought_count == 0
+
+
+@pytest.mark.asyncio
+async def test_context_navigation_and_disabled_boundaries(tui_environment):
+    app = StickyApp()
+    first = insert_note(app, "First note")
+    second = insert_note(app, "Second note")
+    async with app.run_test(size=(120, 30)) as pilot:
+        await settled(app, pilot)
+        app.push_screen(DetailScreen(first.id, [first.id, second.id]))
+        await settled(app, pilot)
         screen = app.screen
-        assert isinstance(screen, DetailScreen)
-        action_bar = screen.query_one("#detail-action-bar")
-        assert action_bar is not None
+        assert screen.query_one("#nav-prev").disabled
+        await pilot.press("right")
+        await settled(app, pilot)
+        assert screen._thought_data["id"] == second.id
+        assert screen.query_one("#nav-next").disabled
+        await pilot.press("left")
+        await settled(app, pilot)
+        assert screen._thought_data["id"] == first.id
 
 
-# ---------------------------------------------------------------------------
-# Review view tests
-# ---------------------------------------------------------------------------
+def test_retained_row_helpers():
+    assert "idea" in _category_badge("idea").plain
+    assert "?" in _category_badge(None).plain
+    assert _relative_time("not-a-date") == ""
 
 
 @pytest.mark.asyncio
-async def test_review_view_present():
-    """Verify the review view is rendered in the Review tab."""
+@pytest.mark.parametrize("destination", ["search", "detail"])
+async def test_capture_completion_preserves_current_navigation(tui_environment, monkeypatch, destination):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        review = pilot.app.query_one("#review-view", ReviewView)
-        assert review is not None
+    existing = insert_note(app, "Already saved note")
+    started, release = threading.Event(), threading.Event()
+    original = StickyService.capture
+
+    def slow_capture(self, *args, **kwargs):
+        started.set()
+        assert release.wait(8)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(StickyService, "capture", slow_capture)
+    try:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await settled(app, pilot)
+            app.query_one(CaptureInput).value = "Finish this save locally"
+            await pilot.press("enter")
+            await worker_started(started)
+            if destination == "search":
+                await pilot.press("ctrl+f")
+                await pilot.pause()
+                current_input = app.query_one("#search-input", Input)
+                current_input.value = "Keep this search draft"
+                assert app.focused is current_input
+            else:
+                app.push_screen(DetailScreen(existing.id))
+                await pilot.pause()
+            current_screen = app.screen
+            tabs = app.query_one(TabbedContent)
+            old_pane = app.query_one("#home" if destination == "search" else "#search", TabPane)
+            tabs.post_message(TabPane.Focused(old_pane))
+            app._focus_home_input()
+            release.set()
+            await settled(app, pilot)
+            assert app.screen is current_screen
+            assert app._get_service().stats()["thoughts"]["total"] == 2
+            if destination == "search":
+                assert tabs.active == "search"
+                assert app.focused is current_input
+                assert current_input.value == "Keep this search draft"
+                assert current_input.is_on_screen
+            else:
+                assert tabs.active == "home"
+                assert app.screen._thought_data["id"] == existing.id
+                assert app.focused is not app.query_one(CaptureInput)
+                assert app.focused.screen is current_screen
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
-async def test_review_view_has_list():
-    """Verify the review view contains a review list."""
+@pytest.mark.parametrize("old_fails", [False, True])
+async def test_obsolete_home_refresh_cannot_replace_newer_list(tui_environment, monkeypatch, old_fails):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        review_list = pilot.app.query_one("#review-list", ReviewList)
-        assert review_list is not None
+    first = insert_note(app, "Earlier note")
+    started, release = threading.Event(), threading.Event()
+    completed = asyncio.Event()
+    original_list = StickyService.list_thoughts
+    original_populate = HomeView._populate_thoughts
+    original_failure = HomeView._load_failed
+    first_request = True
+
+    def snapshots(self, **kwargs):
+        nonlocal first_request
+        result = original_list(self, **kwargs)
+        if first_request:
+            first_request = False
+            started.set()
+            assert release.wait(8)
+            if old_fails:
+                raise OSError("obsolete refresh failure")
+        return result
+
+    async def observe_population(self, thoughts, generation):
+        await original_populate(self, thoughts, generation)
+        if generation == old_generation:
+            completed.set()
+
+    def observe_failure(self, error, generation):
+        original_failure(self, error, generation)
+        if generation == old_generation:
+            completed.set()
+
+    try:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await settled(app, pilot)
+            home = app.query_one(HomeView)
+            monkeypatch.setattr(StickyService, "list_thoughts", snapshots)
+            monkeypatch.setattr(HomeView, "_populate_thoughts", observe_population)
+            monkeypatch.setattr(HomeView, "_load_failed", observe_failure)
+            notices = []
+            monkeypatch.setattr(app, "notify", lambda message, **kwargs: notices.append(message))
+            home.load_thoughts()
+            old_generation = home._load_generation
+            await worker_started(started)
+            second = insert_note(app, "Newly saved note")
+            home.load_thoughts()
+            await settled(app, pilot)
+            assert {row.thought["id"] for row in app.query_one(ThoughtList).children} == {first.id, second.id}
+            release.set()
+            await asyncio.wait_for(completed.wait(), 3)
+            await pilot.pause()
+            assert {row.thought["id"] for row in app.query_one(ThoughtList).children} == {first.id, second.id}
+            assert notices == []
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
-async def test_review_empty_state():
-    """Verify the empty state message when no review items exist."""
+async def test_failed_search_clears_previous_matches_and_allows_retry(tui_environment, monkeypatch):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        # Allow workers to load
-        await pilot.pause()
-        await pilot.pause()
+    thought = insert_note(app, "Passport renewal in December")
+    original = StickyService.search
 
-        empty_widget = pilot.app.query_one("#review-empty")
-        assert empty_widget is not None
-        # With no thoughts needing review, the empty state should be visible
-        # (It might take a moment for workers to complete)
+    def fail_new_query(self, query, **kwargs):
+        if query == "medical appointment":
+            raise OSError("search failure")
+        return original(self, query=query, **kwargs)
+
+    monkeypatch.setattr(StickyService, "search", fail_new_query)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        await pilot.press("ctrl+f")
+        await pilot.pause()
+        inp = app.query_one("#search-input", Input)
+        inp.value = "Passport"
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert [row.result["id"] for row in app.query_one(SearchResultsList).children] == [thought.id]
+        inp.value = "medical appointment"
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert not app.query_one(SearchResultsList).children
+        assert inp.value == "medical appointment"
+        assert "Search failed" in str(app.query_one("#search-status", Static).render())
+        monkeypatch.setattr(StickyService, "search", original)
+        await pilot.press("enter")
+        await settled(app, pilot)
+        assert "Search failed" not in str(app.query_one("#search-status", Static).render())
 
 
 @pytest.mark.asyncio
-async def test_review_view_shows_items():
-    """Verify the review view shows low-confidence thoughts."""
+@pytest.mark.parametrize("old_fails", [False, True])
+async def test_old_detail_read_cannot_replace_a_fresh_read_of_same_note(tui_environment, monkeypatch, old_fails):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
+    first = insert_note(app, "Old first note content")
+    second = insert_note(app, "Second note")
+    started, release = threading.Event(), threading.Event()
+    completed = asyncio.Event()
+    original_read = StickyService.get_thought
+    original_populate = DetailScreen._populate_detail
+    original_failure = DetailScreen._load_failed
+    first_request = True
 
-        # Insert a low-confidence thought that needs review
-        svc = app._get_service()
-        svc.db.initialize()
-        from sticky.core.models import Thought
+    def old_snapshot(self, thought_id):
+        nonlocal first_request
+        snapshot = original_read(self, thought_id)
+        if thought_id == first.id and first_request:
+            first_request = False
+            started.set()
+            assert release.wait(8)
+            if old_fails:
+                raise OSError("obsolete first note failure")
+        return snapshot
 
-        thought = Thought.create(
-            content="Low confidence review test thought",
-            category="action",
-            confidence=0.35,
-            needs_review=True,
-            source="test",
-        )
-        svc.db.insert_thought(thought)
+    def observe_population(self, thought, generation=None):
+        original_populate(self, thought, generation)
+        if generation == 1:
+            completed.set()
 
-        # Reload review items
-        review_view = pilot.app.query_one("#review-view", ReviewView)
-        review_view.load_review_items()
+    def observe_failure(self, thought_id, generation, error):
+        original_failure(self, thought_id, generation, error)
+        if generation == 1:
+            completed.set()
 
-        # Allow workers to complete
-        await pilot.pause()
-        await pilot.pause()
-        await pilot.pause()
-
-        review_list = pilot.app.query_one("#review-list", ReviewList)
-        assert review_list is not None
+    monkeypatch.setattr(StickyService, "get_thought", old_snapshot)
+    monkeypatch.setattr(DetailScreen, "_populate_detail", observe_population)
+    monkeypatch.setattr(DetailScreen, "_load_failed", observe_failure)
+    try:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await settled(app, pilot)
+            app.push_screen(DetailScreen(first.id, [first.id, second.id]))
+            await worker_started(started)
+            screen = app.screen
+            await pilot.press("right")
+            await settled(app, pilot)
+            assert screen._thought_data["id"] == second.id
+            app._get_service().update(first.id, "Fresh first note content")
+            await pilot.press("left")
+            await settled(app, pilot)
+            assert screen._thought_data["content"] == "Fresh first note content"
+            release.set()
+            await asyncio.wait_for(completed.wait(), 3)
+            await pilot.pause()
+            assert screen._thought_data["content"] == "Fresh first note content"
+            assert str(screen.query_one("#detail-status", Static).render()) == ""
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
-async def test_review_item_compose():
-    """Verify ReviewItem can compose with thought data."""
-    thought = {
-        "id": "review-test-123",
-        "content": "Test review item content",
-        "category": "action",
-        "confidence": 0.35,
-        "created_at": "2025-01-01T00:00:00+00:00",
-        "metadata": {"entities": ["Marcus"]},
-    }
-    item = ReviewItem(thought)
-    assert item.thought == thought
-
-
-@pytest.mark.asyncio
-async def test_review_action_bar_present():
-    """Verify the review view has the action bar."""
+@pytest.mark.parametrize("phase,new_query", [("clear", False), ("extend", False), ("extend", True)])
+async def test_clear_invalidates_pending_result_population(tui_environment, monkeypatch, phase, new_query):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
+    old_note = insert_note(app, "Passport renewal in December")
+    new_note = insert_note(app, "Dentist appointment next week")
+    started, release = asyncio.Event(), asyncio.Event()
+    original = getattr(SearchResultsList, phase)
+    first_request = True
+
+    async def delayed_update(self, *args):
+        nonlocal first_request
+        if first_request:
+            first_request = False
+            if phase == "clear":
+                await original(self, *args)
+            started.set()
+            await release.wait()
+            if phase == "extend":
+                await original(self, *args)
+        else:
+            await original(self, *args)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        await pilot.press("ctrl+f")
         await pilot.pause()
-        action_bar = pilot.app.query_one("#review-action-bar")
-        assert action_bar is not None
+        monkeypatch.setattr(SearchResultsList, phase, delayed_update)
+        inp = app.query_one("#search-input", Input)
+        inp.value = "Passport"
+        app.query_one(SearchView)._start_search("Passport")
+        await asyncio.wait_for(started.wait(), 3)
+        try:
+            await pilot.click("#search-clear")
+            assert inp.value == ""
+            assert not app.query_one(SearchResultsList).children
+            if new_query:
+                inp.value = "Dentist"
+                await pilot.press("enter")
+                await settled(app, pilot)
+                assert [row.result["id"] for row in app.query_one(SearchResultsList).children] == [new_note.id]
+            release.set()
+            await settled(app, pilot)
+            ids = [row.result["id"] for row in app.query_one(SearchResultsList).children]
+            assert ids == ([new_note.id] if new_query else [])
+            assert old_note.id not in ids
+            message = str(app.query_one("#search-status", Static).render())
+            assert message == ("1 note found. Select a note to open it." if new_query else "Enter searches your notes. Escape returns Home.")
+        finally:
+            release.set()
 
 
 @pytest.mark.asyncio
-async def test_keybinding_legend_has_review_context():
-    """Verify the keybinding legend has a review context entry."""
-    from sticky.tui.widgets.keybinding_legend import LEGENDS
-
-    assert "review" in LEGENDS
-    assert "Accept" in LEGENDS["review"]
-    assert "Reclassify" in LEGENDS["review"]
-
-
-@pytest.mark.asyncio
-async def test_keybinding_legend_has_detail_context():
-    """Verify the keybinding legend has a detail context entry."""
-    from sticky.tui.widgets.keybinding_legend import LEGENDS
-
-    assert "detail" in LEGENDS
-    assert "Edit" in LEGENDS["detail"]
-    assert "Related" in LEGENDS["detail"]
-
-
-# ---------------------------------------------------------------------------
-# Entities view tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_entities_view_renders():
-    """Verify the entities view renders with three columns."""
+async def test_long_unicode_edit_preserves_content_and_displays_attribution(tui_environment):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        entities_view = pilot.app.query_one("#entities-view", EntitiesView)
-        assert entities_view is not None
-
-        # Verify three column panels exist
-        type_filter = pilot.app.query_one("#type-filter", TypeFilter)
-        assert type_filter is not None
-
-        entity_list_panel = pilot.app.query_one("#entity-list-panel", EntityList)
-        assert entity_list_panel is not None
-
-        entity_detail = pilot.app.query_one("#entity-detail", EntityDetail)
-        assert entity_detail is not None
-
-
-@pytest.mark.asyncio
-async def test_entities_view_has_filter_input():
-    """Verify the entities view has a filter input."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        filter_input = pilot.app.query_one("#entity-filter-input")
-        assert filter_input is not None
-
-
-@pytest.mark.asyncio
-async def test_entities_view_has_type_filter_list():
-    """Verify the type filter sidebar has a list."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        type_filter_list = pilot.app.query_one("#type-filter-list")
-        assert type_filter_list is not None
-
-
-@pytest.mark.asyncio
-async def test_entities_view_has_entity_list():
-    """Verify the entity list panel has a ListView."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        entity_list = pilot.app.query_one("#entity-list")
-        assert entity_list is not None
-
-
-@pytest.mark.asyncio
-async def test_entities_view_has_pinned_context():
-    """Verify the entity detail panel has a pinned context box."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        pinned_context = pilot.app.query_one("#pinned-context", PinnedContext)
-        assert pinned_context is not None
-
-
-@pytest.mark.asyncio
-async def test_entities_view_has_linked_thoughts_list():
-    """Verify the entity detail panel has a linked thoughts list."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        linked_list = pilot.app.query_one("#linked-thoughts-list")
-        assert linked_list is not None
-
-
-@pytest.mark.asyncio
-async def test_entity_row_compose():
-    """Verify EntityRow can compose with entity data."""
-    entity = {
-        "id": "entity-test-123",
-        "name": "Sarah",
-        "entity_type": "person",
-        "mention_count": 7,
-    }
-    row = EntityRow(entity)
-    assert row.entity == entity
-
-
-@pytest.mark.asyncio
-async def test_entity_type_badge():
-    """Verify entity type badge produces colored text."""
-    from sticky.tui.views.entities_view import _entity_type_badge
-
-    badge = _entity_type_badge("person")
-    assert "person" in badge.plain
-
-    badge = _entity_type_badge("project")
-    assert "project" in badge.plain
-
-    badge = _entity_type_badge(None)
-    assert "?" in badge.plain
-
-
-# ---------------------------------------------------------------------------
-# Digest view tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_digest_view_renders():
-    """Verify the digest view renders."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        digest_view = pilot.app.query_one("#digest-view", DigestView)
-        assert digest_view is not None
-
-
-@pytest.mark.asyncio
-async def test_digest_period_selector():
-    """Verify Day/Week/Month tabs exist in the period selector."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        selector = pilot.app.query_one("#period-selector", PeriodSelector)
-        assert selector is not None
-
-        # Verify period tabs
-        day_tab = pilot.app.query_one("#period-day", PeriodTab)
-        assert day_tab is not None
-        assert day_tab.period == "day"
-
-        week_tab = pilot.app.query_one("#period-week", PeriodTab)
-        assert week_tab is not None
-        assert week_tab.period == "week"
-
-        month_tab = pilot.app.query_one("#period-month", PeriodTab)
-        assert month_tab is not None
-        assert month_tab.period == "month"
-
-
-@pytest.mark.asyncio
-async def test_digest_view_has_content():
-    """Verify the digest view has a content area."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        content = pilot.app.query_one("#digest-content", DigestContent)
-        assert content is not None
-
-
-@pytest.mark.asyncio
-async def test_digest_view_empty():
-    """No thoughts captured results in empty state."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        # Allow workers to complete
-        await pilot.pause()
-        await pilot.pause()
-
-        # The digest content should exist and show either
-        # empty state or loading state (both are valid on startup)
-        content = pilot.app.query_one("#digest-content", DigestContent)
-        assert content is not None
-
-
-@pytest.mark.asyncio
-async def test_digest_default_period_is_day():
-    """Verify the default active period is 'day'."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        selector = pilot.app.query_one("#period-selector", PeriodSelector)
-        assert selector.active_period == "day"
-
-
-@pytest.mark.asyncio
-async def test_keybinding_legend_has_entities_context():
-    """Verify the keybinding legend has an entities context entry."""
-    from sticky.tui.widgets.keybinding_legend import LEGENDS
-
-    assert "entities" in LEGENDS
-    assert "Merge" in LEGENDS["entities"]
-    assert "Filter" in LEGENDS["entities"]
-
-
-@pytest.mark.asyncio
-async def test_keybinding_legend_has_digest_context():
-    """Verify the keybinding legend has a digest context entry."""
-    from sticky.tui.widgets.keybinding_legend import LEGENDS
-
-    assert "digest" in LEGENDS
-    assert "Regenerate" in LEGENDS["digest"]
-    assert "Expand topic" in LEGENDS["digest"]
-
-
-# ---------------------------------------------------------------------------
-# Stats view tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_stats_view_renders():
-    """Verify the stats view renders with all sections."""
-    from sticky.tui.views.stats_view import (
-        ClassificationStats,
-        DataFlowSection,
-        LibraryStats,
-        StatsView,
+    content = "猫 🐈 café e\u0301 👩🏽‍💻 [literal] <html>\n" + "保留每一个字和换行。" * 100
+    edited = "    " + content + "\n\n"
+    thought = Thought.create(
+        content=content, source="import",
+        source_url="https://example.test/original/article?tag=[literal]",
+        metadata={"thread": "Source thread [literal] 👩🏽‍💻", "custom": "keep attribution"},
     )
-
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        stats_view = pilot.app.query_one("#stats-view", StatsView)
-        assert stats_view is not None
-
-        # Verify all three sections exist
-        library = pilot.app.query_one("#library-stats", LibraryStats)
-        assert library is not None
-
-        classification = pilot.app.query_one(
-            "#classification-stats", ClassificationStats
-        )
-        assert classification is not None
-
-        data_flow = pilot.app.query_one("#data-flow-section", DataFlowSection)
-        assert data_flow is not None
+    app._get_service().db.insert_thought(thought)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        screen = await open_note(app, pilot, thought)
+        assert screen._thought_data["content"] == content
+        meta_text = str(screen.query_one("#meta-content", Static).render())
+        assert thought.source_url in meta_text
+        assert thought.metadata["thread"] in meta_text
+        await pilot.press("e")
+        screen.query_one(TextArea).load_text(edited)
+        await pilot.press("ctrl+s")
+        await settled(app, pilot)
+        saved = app._get_service().get_thought(thought.id)
+        assert saved["content"] == edited
+        assert saved["source_url"] == thought.source_url
+        assert saved["metadata"] == thought.metadata
 
 
 @pytest.mark.asyncio
-async def test_stats_data_flow_section():
-    """Verify the DATA FLOW section has LOCAL/CLOUD indicators."""
-    from sticky.tui.views.stats_view import DataFlowSection
-
+async def test_failed_delete_remains_retryable(tui_environment, monkeypatch):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        # Allow workers to complete
-        await pilot.pause()
-        await pilot.pause()
+    thought = insert_note(app)
+    original = StickyService.delete
+    attempts = 0
 
-        data_flow = pilot.app.query_one("#data-flow-section", DataFlowSection)
-        assert data_flow is not None
+    def fail_once(self, thought_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("delete disk failure")
+        return original(self, thought_id)
+
+    monkeypatch.setattr(StickyService, "delete", fail_once)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        screen = await open_note(app, pilot, thought)
+        await pilot.press("d")
+        await pilot.click("#delete-yes")
+        await settled(app, pilot)
+        assert app._get_service().db.get_thought(thought.id) is not None
+        assert not screen._busy
+        assert "delete disk failure" in str(screen.query_one("#detail-status", Static).render())
+        assert "visible" in screen.query_one("#delete-confirm").classes
+        # Textual ignores clicks during the button's native pressed effect.
+        delete_button = screen.query_one("#delete-yes")
+        await wait_until(pilot, lambda: not delete_button.has_class("-active"), "Delete retry button did not become ready")
+        await pilot.click("#delete-yes")
+        await settled(app, pilot)
+        assert app._get_service().db.get_thought(thought.id) is None
+        assert not isinstance(app.screen, DetailScreen)
+        assert attempts == 2
 
 
 @pytest.mark.asyncio
-async def test_stats_view_in_tab():
-    """Verify the stats view is accessible as a tab."""
+@pytest.mark.parametrize("destination", ["home", "search"])
+async def test_queued_pane_focus_cannot_reverse_explicit_navigation(tui_environment, destination):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        # The stats tab should exist
-        pane = pilot.app.query_one("#stats")
-        assert pane is not None
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        tabs = app.query_one(TabbedContent)
+        if destination == "home":
+            await pilot.press("ctrl+f")
+            await settled(app, pilot)
+            old_pane = app.query_one("#search", TabPane)
+            await pilot.press("escape")
+            intended = app.query_one(CaptureInput)
+        else:
+            old_pane = app.query_one("#home", TabPane)
+            await pilot.press("ctrl+f")
+            intended = app.query_one("#search-input", Input)
+        # This is the real queued message that previously undid the key action.
+        tabs.post_message(TabPane.Focused(old_pane))
+        await settled(app, pilot)
+        assert tabs.active == destination
+        assert app.focused is intended
+        assert intended.is_on_screen
 
 
 @pytest.mark.asyncio
-async def test_keybinding_legend_has_stats_context():
-    """Verify the keybinding legend has a stats context entry."""
-    from sticky.tui.widgets.keybinding_legend import LEGENDS
-
-    assert "stats" in LEGENDS
-    assert "Home" in LEGENDS["stats"]
-
-
-# ---------------------------------------------------------------------------
-# Settings view tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_settings_accessible():
-    """Verify the settings screen can be pushed."""
-    from sticky.tui.views.settings import SettingsScreen
-
+async def test_header_clicks_and_arrow_keys_still_change_tabs(tui_environment):
     app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        app.push_screen(SettingsScreen())
-        await pilot.pause()
-
-        screen = app.screen
-        assert isinstance(screen, SettingsScreen)
-
-
-@pytest.mark.asyncio
-async def test_settings_has_table():
-    """Verify the settings screen has a DataTable."""
-    from sticky.tui.views.settings import SettingsScreen, SettingsTable
-
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        app.push_screen(SettingsScreen())
-        await pilot.pause()
-        await pilot.pause()
-
-        screen = app.screen
-        assert isinstance(screen, SettingsScreen)
-
-        table = screen.query_one("#settings-table", SettingsTable)
-        assert table is not None
-
-
-@pytest.mark.asyncio
-async def test_settings_has_legend():
-    """Verify the settings screen has the keybinding legend."""
-    from sticky.tui.views.settings import SettingsScreen
-
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        app.push_screen(SettingsScreen())
-        await pilot.pause()
-
-        screen = app.screen
-        legend = screen.query_one("#settings-legend")
-        assert legend is not None
-
-
-# ---------------------------------------------------------------------------
-# Command palette tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_command_palette_opens():
-    """Verify the command palette can be opened."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        app.push_screen(CommandPalette())
-        await pilot.pause()
-
-        screen = app.screen
-        assert isinstance(screen, CommandPalette)
-
-
-@pytest.mark.asyncio
-async def test_command_palette_has_input():
-    """Verify the command palette has a filter input."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        app.push_screen(CommandPalette())
-        await pilot.pause()
-
-        screen = app.screen
-        palette_input = screen.query_one("#palette-input")
-        assert palette_input is not None
-
-
-@pytest.mark.asyncio
-async def test_command_palette_has_commands():
-    """Verify the command palette has command items."""
-    app = StickyApp()
-    async with app.run_test(size=(120, 30)) as pilot:
-        await pilot.pause()
-        app.push_screen(CommandPalette())
-        await pilot.pause()
-
-        screen = app.screen
-        cmd_list = screen.query_one("#palette-list")
-        assert cmd_list is not None
-        # Should have at least one command item
-        items = screen.query(CommandItem)
-        assert len(items) > 0
+    async with app.run_test(size=(80, 24)) as pilot:
+        await settled(app, pilot)
+        tabs = app.query_one(TabbedContent)
+        for tab_id in ("search", "about", "home"):
+            await pilot.click(f"#--content-tab-{tab_id}")
+            await settled(app, pilot)
+            assert tabs.active == tab_id
+            assert app.focused.is_on_screen
+        header = tabs.query_one(Tabs)
+        for key, tab_id in (("right", "search"), ("right", "about"), ("left", "search")):
+            header.focus()
+            await wait_until(pilot, lambda: app.focused is header, "Header tabs did not focus")
+            await pilot.press(key)
+            await settled(app, pilot)
+            assert tabs.active == tab_id
+            assert app.focused.is_on_screen

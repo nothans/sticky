@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 from sticky.core.models import (
     ActionItem,
-    ClassificationResult,
     Digest,
     Entity,
     EntityMention,
@@ -228,29 +227,6 @@ def test_action_item_completed():
     a = ActionItem(content="done", completed=True, completed_at="2026-01-15T00:00:00+00:00")
     assert a.completed is True
     assert a.completed_at is not None
-
-
-def test_classification_result():
-    cr = ClassificationResult(
-        category="work",
-        confidence=0.92,
-        topics=["auth", "api"],
-        people=["Sarah"],
-        projects=["sticky"],
-        actions=["review PR"],
-    )
-    assert cr.category == "work"
-    assert cr.confidence == 0.92
-    assert cr.topics == ["auth", "api"]
-    assert cr.people == ["Sarah"]
-
-
-def test_classification_result_defaults():
-    cr = ClassificationResult(category="personal", confidence=0.8)
-    assert cr.topics == []
-    assert cr.people == []
-    assert cr.projects == []
-    assert cr.actions == []
 
 
 def test_search_result():

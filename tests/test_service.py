@@ -30,7 +30,6 @@ def test_capture_stores_thought(service):
     assert "category" in result
     assert "confidence" in result
     assert "needs_review" in result
-    assert "entities" in result
 
 
 def test_capture_and_search(service):
@@ -95,8 +94,6 @@ def test_stats(service):
     result = service.stats()
     assert "thoughts" in result
     assert result["thoughts"]["total"] == 1
-    assert "entities" in result
-    assert "digests" in result
     assert "system" in result
     assert "db_path" in result["system"]
 
@@ -220,20 +217,6 @@ def test_import_skip_duplicates(service, tmp_path):
     assert result["skipped"] >= 1
 
 
-def test_related_thoughts(service):
-    """Related thoughts should find semantically similar content."""
-    r1 = service.capture("Python web frameworks like Flask and Django")
-    service.capture("JavaScript frontend frameworks React and Vue")
-    service.capture("Database optimization techniques for SQL")
-
-    related = service.related_thoughts(r1["id"], limit=2)
-    assert isinstance(related, list)
-    assert len(related) <= 2
-    # Should have score
-    if related:
-        assert "score" in related[0]
-
-
 def test_privacy_info(service):
     """Privacy info should describe data flows."""
     info = service.privacy_info()
@@ -241,15 +224,8 @@ def test_privacy_info(service):
     flow = info["data_flow"]
     assert flow["embeddings"] == "LOCAL"
     assert flow["storage"] == "LOCAL"
-    assert flow["classification"] == "CLOUD"
-    assert flow["digest"] == "CLOUD"
-
-
-def test_list_actions(service):
-    """List actions should return action items."""
-    result = service.list_actions()
-    assert "actions" in result
-    assert "total" in result
+    assert flow["capture"] == "LOCAL"
+    assert flow["digest"] == "CLOUD_ON_REQUEST"
 
 
 def test_capture_with_template(service):
@@ -259,15 +235,6 @@ def test_capture_with_template(service):
     )
     assert "id" in result
     assert result["content"] == "Meeting notes from standup"
-
-
-def test_get_review_items(service):
-    """get_review_items should return thoughts needing review."""
-    # With test-key, classification fails, so thoughts get needs_review=True
-    service.capture("Review me please")
-    result = service.get_review_items()
-    assert "items" in result
-    assert "total" in result
 
 
 def test_classify_thought(service):
@@ -287,25 +254,6 @@ def test_classify_nonexistent_thought(service):
         service.classify_thought("nonexistent-id", "idea")
 
 
-def test_list_entities(service):
-    """List entities should return entity list."""
-    result = service.list_entities()
-    assert "entities" in result
-    assert "total" in result
-
-
-def test_digest(service):
-    """Digest generation should return structured result."""
-    service.capture("Morning standup about sprint planning")
-    service.capture("Discussed deployment pipeline with DevOps")
-
-    result = service.digest(period="day")
-    assert "digest" in result
-    assert "period" in result
-    assert "thought_count" in result
-    assert "digest_id" in result
-
-
 def test_get_config_display(service):
     """Config display should show config with sources."""
     result = service.get_config_display()
@@ -316,7 +264,7 @@ def test_get_config_display(service):
 
 def test_set_config_value(service):
     """Set config value should return previous value."""
-    result = service.set_config_value("confidence_threshold", 0.8)
+    result = service.set_config_value("default_search_limit", 8)
     assert "key" in result
     assert "previous" in result
     assert "new" in result
@@ -328,31 +276,6 @@ def test_search_with_filters(service):
 
     results = service.search("Python", limit=5, mode="hybrid")
     assert isinstance(results, list)
-
-
-def test_complete_action(service):
-    """Complete action should mark it done."""
-    # Manually insert an action item
-    from sticky.core.models import ActionItem
-
-    action = ActionItem(content="Test action", source_thought_id=None)
-    service.db.insert_action_item(action)
-
-    result = service.complete_action(action.id)
-    assert result["completed"] is True
-
-
-def test_complete_nonexistent_action(service):
-    """Complete nonexistent action should raise ValueError."""
-    with pytest.raises(ValueError, match="not found"):
-        service.complete_action("nonexistent-id")
-
-
-def test_entity_context_summary(service):
-    """Entity context summary should return a string."""
-    # With no entities, should handle gracefully
-    result = service.entity_context_summary("nonexistent-id")
-    assert isinstance(result, str)
 
 
 def test_search_returns_timing(service):
@@ -370,7 +293,7 @@ def test_capture_stores_embedding_model(service):
 
     thought = service.db.get_thought(thought_id)
     assert thought is not None
-    assert thought.embedding_model == service.config.embedding_model
+    assert thought.embedding_model == service.embedding_engine.model_name
     assert thought.embedding_model == "all-MiniLM-L6-v2"
 
 
@@ -389,161 +312,6 @@ def test_export_with_category_filter(service, tmp_path):
     with open(output_path) as f:
         data = json.load(f)
     assert all(t["category"] == "idea" for t in data["thoughts"])
-
-
-def test_reclassify_batch(service, monkeypatch):
-    """reclassify_batch should re-classify thoughts with null category or low confidence."""
-    from unittest.mock import MagicMock
-
-    from sticky.core.models import ClassificationResult, Thought
-
-    # Directly insert a thought that bypasses the capture pipeline
-    thought = Thought.create(
-        content="Meeting with Sarah about Q3 roadmap",
-        category=None,
-        confidence=0.0,
-        needs_review=True,
-        source="test",
-    )
-    service.db.insert_thought(thought)
-
-    # Verify it was stored with null category
-    stored = service.db.get_thought(thought.id)
-    assert stored.category is None
-    assert stored.confidence == 0.0
-
-    # Mock the classifier to return a successful classification
-    mock_result = ClassificationResult(
-        category="meeting",
-        confidence=0.85,
-        topics=["roadmap", "Q3"],
-        people=["Sarah"],
-        projects=[],
-        actions=[],
-    )
-    mock_classifier = MagicMock()
-    mock_classifier.classify_sync.return_value = mock_result
-    monkeypatch.setattr(service, "classifier", mock_classifier)
-
-    # Mock entity resolver to avoid side effects
-    mock_resolver = MagicMock()
-    mock_resolver.resolve_entities.return_value = []
-    monkeypatch.setattr(service, "entity_resolver", mock_resolver)
-
-    # Run reclassify_batch
-    result = service.reclassify_batch()
-
-    assert result["total_candidates"] >= 1
-    assert result["reclassified"] >= 1
-    assert len(result["errors"]) == 0
-
-    # Verify the thought was updated in the DB
-    updated = service.db.get_thought(thought.id)
-    assert updated.category == "meeting"
-    assert updated.confidence == 0.85
-    assert updated.needs_review is False
-
-    # Verify the classifier was called with the thought content
-    mock_classifier.classify_sync.assert_called()
-
-    # Verify entity resolution was attempted
-    mock_resolver.resolve_entities.assert_called()
-
-    # Check results list has the expected entry
-    matching = [r for r in result["results"] if r["id"] == thought.id]
-    assert len(matching) == 1
-    assert matching[0]["old_category"] is None
-    assert matching[0]["new_category"] == "meeting"
-    assert matching[0]["confidence"] == 0.85
-
-
-def test_reclassify_batch_handles_classifier_failure(service, monkeypatch):
-    """reclassify_batch should handle classifier errors gracefully."""
-    from unittest.mock import MagicMock
-
-    from sticky.core.models import Thought
-
-    # Insert a thought with null category
-    thought = Thought.create(
-        content="Something to reclassify",
-        category=None,
-        confidence=0.0,
-        needs_review=True,
-        source="test",
-    )
-    service.db.insert_thought(thought)
-
-    # Mock the classifier to raise an exception
-    mock_classifier = MagicMock()
-    mock_classifier.classify_sync.side_effect = RuntimeError("LLM unavailable")
-    monkeypatch.setattr(service, "classifier", mock_classifier)
-
-    result = service.reclassify_batch()
-
-    assert result["total_candidates"] >= 1
-    assert result["reclassified"] == 0
-    assert len(result["errors"]) >= 1
-    assert thought.id in result["errors"][0]
-
-    # Thought should remain unchanged
-    unchanged = service.db.get_thought(thought.id)
-    assert unchanged.category is None
-    assert unchanged.confidence == 0.0
-
-
-def test_related_thoughts_filters_low_scores(service):
-    """Related thoughts should filter out results below 0.45 threshold."""
-    # Capture one thought and some very different thoughts
-    r1 = service.capture("Python web frameworks like Flask and Django")
-    service.capture("Recipes for chocolate cake with vanilla frosting")
-    service.capture("History of ancient Egyptian pharaohs and pyramids")
-    service.capture("Underwater basket weaving techniques for beginners")
-
-    related = service.related_thoughts(r1["id"], limit=10)
-    # All returned results should have score >= 0.45
-    for item in related:
-        assert item["score"] >= 0.45, (
-            f"Score {item['score']} is below the 0.45 threshold"
-        )
-
-
-def test_related_thoughts_sorted_with_scores(service):
-    """Related thoughts should return sorted results with scores."""
-    r1 = service.capture("Python web frameworks like Flask and Django")
-    service.capture("JavaScript frontend frameworks React and Vue")
-    service.capture("Database optimization techniques for SQL")
-    service.capture("Machine learning with Python and TensorFlow")
-
-    related = service.related_thoughts(r1["id"], limit=5)
-    assert isinstance(related, list)
-    # Every result should have a score
-    for item in related:
-        assert "score" in item
-        assert isinstance(item["score"], (int, float))
-    # Results should be sorted by score descending
-    scores = [item["score"] for item in related]
-    assert scores == sorted(scores, reverse=True), (
-        f"Results are not sorted by score: {scores}"
-    )
-
-
-def test_brief_returns_structure(service):
-    """Brief should return the expected keys."""
-    result = service.brief()
-    assert "new_thoughts" in result
-    assert "action_items" in result
-    assert "entity_pulse" in result
-    assert "resurfaced" in result
-    assert "review_count" in result
-    assert isinstance(result["new_thoughts"], int)
-    assert isinstance(result["action_items"], list)
-
-
-def test_synthesize_unknown_entity(service):
-    """Synthesize should handle unknown entities gracefully."""
-    result = service.synthesize("NonexistentEntity")
-    assert result["thought_count"] == 0
-    assert "No entity found" in result["synthesis"]
 
 
 def test_capture_with_thread(service):

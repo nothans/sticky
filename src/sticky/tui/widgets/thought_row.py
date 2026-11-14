@@ -8,42 +8,13 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 
-# Category badge colors matching CLI and wireframe
-_CATEGORY_COLORS: dict[str, str] = {
-    "idea": "cyan",
-    "person": "magenta",
-    "meeting": "blue",
-    "action": "yellow",
-    "project": "green",
-    "ref": "white",
-    "reference": "white",
-    "reflection": "green",
-    "journal": "bright_black",
-}
-
-
-def _confidence_dot(confidence: float | None) -> Text:
-    """Return a colored confidence dot.
-
-    - green (#4ec9b0): confidence >= 0.8
-    - yellow (#d4a843): confidence 0.6-0.8
-    - dim (#555555): confidence < 0.6 or None
-    """
-    if confidence is None or confidence < 0.6:
-        return Text("\u25cb ", style="#555555")  # hollow circle
-    if confidence < 0.8:
-        return Text("\u25cf ", style="#d4a843")  # yellow filled
-    return Text("\u25cf ", style="#4ec9b0")  # green filled
-
-
 def _category_badge(category: str | None) -> Text:
-    """Return a colored category badge."""
+    """A quiet label; one hue for categories rather than a color legend."""
     if category is None:
-        return Text("?       ", style="dim")
-    color = _CATEGORY_COLORS.get(category, "white")
+        return Text("?       ", style="#dde3e8")
     # Pad to 8 chars for alignment
     padded = category.ljust(8)
-    return Text(padded, style=color)
+    return Text(padded, style="#9bbbd4")
 
 
 def _relative_time(created_at: str) -> str:
@@ -80,10 +51,7 @@ def _relative_time(created_at: str) -> str:
 
 
 class ThoughtRow(ListItem):
-    """A single thought row with confidence dot, category badge, time, content.
-
-    Format: . idea     2h ago   What if we used ULID instead of UUID...
-    """
+    """A source note's category, capture time, and literal content."""
 
     DEFAULT_CSS = """
     ThoughtRow {
@@ -102,17 +70,15 @@ class ThoughtRow(ListItem):
     def compose(self):
         """Compose the row content."""
         thought = self.thought
-        confidence = thought.get("confidence")
         category = thought.get("category")
         created_at = thought.get("created_at", "")
         content = thought.get("content", "").replace("\n", " ")
 
         # Build the row text
         line = Text()
-        line.append_text(_confidence_dot(confidence))
         line.append_text(_category_badge(category))
         time_str = _relative_time(created_at).ljust(10)
-        line.append(time_str, style="dim")
+        line.append(time_str, style="#b1bec9")
         line.append(" ")
         # Truncate content to fit
         max_content = 80

@@ -6,6 +6,8 @@ action items, and configuration, with FTS5 keyword search support.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -109,6 +111,7 @@ CREATE TABLE IF NOT EXISTS action_items (
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_thoughts_category ON thoughts(category);
 CREATE INDEX IF NOT EXISTS idx_thoughts_created_at ON thoughts(created_at);
+CREATE INDEX IF NOT EXISTS idx_thoughts_page ON thoughts(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_thoughts_needs_review ON thoughts(needs_review);
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name COLLATE NOCASE);
@@ -122,24 +125,123 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _timestamp_key(value: str) -> tuple:
+    """Compare ISO dates as UTC instants without rewriting stored timestamps."""
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (0, parsed.astimezone(timezone.utc))
+    except (ValueError, OverflowError):
+        # Retain malformed legacy records with a stable, transitive ordering.
+        return (1, value)
+
+
+def _compare_timestamps(left: str, right: str) -> int:
+    left_key, right_key = _timestamp_key(left), _timestamp_key(right)
+    return (left_key > right_key) - (left_key < right_key)
+
+
+def encode_cursor(thought: Thought, sort: str = "created_at_desc") -> str:
+    """Encode the stable list position; callers should treat this as opaque."""
+    payload = json.dumps([thought.created_at, thought.id, sort], separators=(",", ":"))
+    return "v1." + base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str, sort: str) -> tuple[str, str | None]:
+    """Validate a composite cursor, retaining old timestamp-only cursors."""
+    try:
+        datetime.fromisoformat(cursor)
+        return cursor, None
+    except ValueError:
+        pass
+    try:
+        if not cursor.startswith("v1."):
+            raise ValueError
+        cursor = cursor[3:]
+        payload = base64.b64decode(
+            cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True
+        )
+        values = json.loads(payload)
+        if (
+            not isinstance(values, list)
+            or len(values) != 3
+            or not all(isinstance(value, str) for value in values)
+            or values[2] != sort
+        ):
+            raise ValueError
+        return values[0], values[1]
+    except (ValueError, TypeError, UnicodeError, binascii.Error) as exc:
+        raise ValueError("Invalid pagination cursor") from exc
+
+
+def _thought_filters(
+    *,
+    category: str | None = None,
+    entity: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    needs_review: bool | None = None,
+    thread: str | None = None,
+) -> tuple[list[str], list]:
+    """Build bound filters for queries whose thoughts table is aliased as t."""
+    conditions: list[str] = []
+    params: list = []
+    for name, value in (("after", after), ("before", before)):
+        if value is not None and _timestamp_key(value)[0] != 0:
+            raise ValueError(f"{name} must be an ISO date or datetime")
+    if after is not None or before is not None:
+        conditions.append("sticky_valid_timestamp(t.created_at)")
+    for value, clause in (
+        (category, "t.category = ?"),
+        (after, "t.created_at COLLATE sticky_timestamp > ?"),
+        (before, "t.created_at COLLATE sticky_timestamp < ?"),
+        (thread, "json_extract(t.metadata, '$.thread') = ?"),
+    ):
+        if value is not None:
+            conditions.append(clause)
+            params.append(value)
+    if needs_review is not None:
+        conditions.append("t.needs_review = ?")
+        params.append(int(needs_review))
+    if entity is not None:
+        conditions.append(
+            """EXISTS (
+                SELECT 1 FROM entity_mentions em
+                JOIN entities e ON e.id = em.entity_id
+                WHERE em.thought_id = t.id AND e.name = ? COLLATE NOCASE
+            )"""
+        )
+        params.append(entity)
+    return conditions, params
+
+
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
+
+
 class Database:
     """SQLite database wrapper with typed methods for sticky data."""
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
+        self._has_vec: bool | None = None
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
-
-    _has_vec: bool | None = None
 
     def _get_conn(self) -> sqlite3.Connection:
         """Return the active connection, creating one if needed."""
         if self._conn is None:
             self._conn = sqlite3.connect(str(self._db_path))
             self._conn.row_factory = sqlite3.Row
+            self._conn.create_collation("sticky_timestamp", _compare_timestamps)
+            self._conn.create_function("sticky_valid_timestamp", 1, lambda value: _timestamp_key(value)[0] == 0, deterministic=True)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             # Load sqlite-vec extension for vector search (optional)
@@ -147,18 +249,22 @@ class Database:
                 self._conn.enable_load_extension(True)
                 import sqlite_vec
                 sqlite_vec.load(self._conn)
-                self._conn.enable_load_extension(False)
-                Database._has_vec = True
-            except (AttributeError, OSError, Exception):
-                Database._has_vec = False
+                self._has_vec = True
+            except Exception:
+                self._has_vec = False
+            finally:
+                try:
+                    self._conn.enable_load_extension(False)
+                except AttributeError:
+                    pass
         return self._conn
 
     @property
     def has_vec(self) -> bool:
         """Whether sqlite-vec is available."""
-        if Database._has_vec is None:
+        if self._has_vec is None:
             self._get_conn()
-        return Database._has_vec
+        return bool(self._has_vec)
 
     def initialize(self) -> None:
         """Create all tables and indexes if they don't exist."""
@@ -192,25 +298,26 @@ class Database:
             )
             conn.commit()
 
-            # Backfill vec_thoughts from existing embeddings
-            existing = self.execute(
-                "SELECT id, embedding FROM thoughts WHERE embedding IS NOT NULL"
-            ).fetchall()
-            for row in existing:
-                try:
-                    self.execute(
-                        "INSERT OR IGNORE INTO vec_thoughts(thought_id, embedding) VALUES (?, ?)",
-                        (row["id"], row["embedding"]),
-                    )
-                except Exception:
-                    pass
-            conn.commit()
+            # Rebuild derived vectors: notes may have changed while the extension
+            # was unavailable. A failed rebuild leaves the previous index intact.
+            with conn:
+                conn.execute("DELETE FROM vec_thoughts")
+                # Acquire the write transaction before reading current notes so
+                # a concurrent capture cannot disappear from the rebuilt index.
+                existing = conn.execute(
+                    "SELECT id, embedding FROM thoughts WHERE embedding IS NOT NULL"
+                ).fetchall()
+                conn.executemany(
+                    "INSERT INTO vec_thoughts(thought_id, embedding) VALUES (?, ?)",
+                    ((row["id"], row["embedding"]) for row in existing if len(row["embedding"]) == 384 * 4),
+                )
 
     def close(self) -> None:
         """Close the database connection."""
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+            self._has_vec = None
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Execute a SQL statement and return the cursor."""
@@ -221,35 +328,35 @@ class Database:
     # ------------------------------------------------------------------
 
     def insert_thought(self, thought: Thought) -> None:
-        """Insert a thought into the database."""
+        """Insert a thought and its search indexes atomically."""
         conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO thoughts
-               (id, content, embedding, embedding_model, source_url, category, confidence,
-                needs_review, source, metadata, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                thought.id,
-                thought.content,
-                thought.embedding,
-                thought.embedding_model,
-                thought.source_url,
-                thought.category,
-                thought.confidence,
-                int(thought.needs_review),
-                thought.source,
-                thought.metadata_json,
-                thought.created_at,
-                thought.updated_at,
-            ),
-        )
-        # Sync embedding into vec_thoughts for KNN search
-        if thought.embedding is not None and self.has_vec:
+        with conn:
             conn.execute(
-                "INSERT OR REPLACE INTO vec_thoughts(thought_id, embedding) VALUES (?, ?)",
-                (thought.id, thought.embedding),
+                """INSERT INTO thoughts
+                   (id, content, embedding, embedding_model, source_url, category, confidence,
+                    needs_review, source, metadata, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    thought.id,
+                    thought.content,
+                    thought.embedding,
+                    thought.embedding_model,
+                    thought.source_url,
+                    thought.category,
+                    thought.confidence,
+                    int(thought.needs_review),
+                    thought.source,
+                    thought.metadata_json,
+                    thought.created_at,
+                    thought.updated_at,
+                ),
             )
-        conn.commit()
+            # Sync embedding into vec_thoughts for KNN search.
+            if thought.embedding is not None and self.has_vec:
+                conn.execute(
+                    "INSERT OR REPLACE INTO vec_thoughts(thought_id, embedding) VALUES (?, ?)",
+                    (thought.id, thought.embedding),
+                )
 
     def get_thought(self, thought_id: str) -> Thought | None:
         """Retrieve a thought by ID, or None if not found."""
@@ -262,7 +369,7 @@ class Database:
 
     def list_thoughts(
         self,
-        limit: int = 20,
+        limit: int | None = 20,
         cursor: str | None = None,
         category: str | None = None,
         entity: str | None = None,
@@ -276,7 +383,7 @@ class Database:
 
         Args:
             limit: Maximum number of thoughts to return.
-            cursor: Pagination cursor (created_at value to continue from).
+            cursor: Opaque cursor from encode_cursor (or a legacy timestamp).
             category: Filter by category.
             entity: Filter by entity name (uses subquery on entity_mentions + entities).
             after: Only return thoughts created after this ISO timestamp.
@@ -288,38 +395,12 @@ class Database:
         Returns:
             Tuple of (list of Thoughts, total count matching filters).
         """
-        conditions: list[str] = []
-        params: list = []
-
-        if category is not None:
-            conditions.append("t.category = ?")
-            params.append(category)
-
-        if needs_review is not None:
-            conditions.append("t.needs_review = ?")
-            params.append(int(needs_review))
-
-        if after is not None:
-            conditions.append("t.created_at > ?")
-            params.append(after)
-
-        if before is not None:
-            conditions.append("t.created_at < ?")
-            params.append(before)
-
-        if entity is not None:
-            conditions.append(
-                """t.id IN (
-                    SELECT em.thought_id FROM entity_mentions em
-                    JOIN entities e ON e.id = em.entity_id
-                    WHERE e.name = ? COLLATE NOCASE
-                )"""
-            )
-            params.append(entity)
-
-        if thread is not None:
-            conditions.append("json_extract(t.metadata, '$.thread') = ?")
-            params.append(thread)
+        if sort not in {"created_at_asc", "created_at_desc"}:
+            raise ValueError("sort must be created_at_asc or created_at_desc")
+        conditions, params = _thought_filters(
+            category=category, entity=entity, after=after, before=before,
+            needs_review=needs_review, thread=thread,
+        )
 
         where = ""
         if conditions:
@@ -331,19 +412,22 @@ class Database:
 
         # Sort direction
         if sort == "created_at_asc":
-            order = "t.created_at ASC"
+            order = "t.created_at COLLATE sticky_timestamp ASC, t.id ASC"
         else:
-            order = "t.created_at DESC"
+            order = "t.created_at COLLATE sticky_timestamp DESC, t.id DESC"
 
         # Cursor pagination
         cursor_conditions = list(conditions)
         cursor_params = list(params)
         if cursor is not None:
-            if sort == "created_at_asc":
-                cursor_conditions.append("t.created_at > ?")
+            created_at, thought_id = _decode_cursor(cursor, sort)
+            operator = ">" if sort == "created_at_asc" else "<"
+            if thought_id is None:
+                cursor_conditions.append(f"t.created_at COLLATE sticky_timestamp {operator} ?")
+                cursor_params.append(created_at)
             else:
-                cursor_conditions.append("t.created_at < ?")
-            cursor_params.append(cursor)
+                cursor_conditions.append(f"(t.created_at COLLATE sticky_timestamp, t.id) {operator} (?, ?)")
+                cursor_params.extend((created_at, thought_id))
 
         cursor_where = ""
         if cursor_conditions:
@@ -353,7 +437,7 @@ class Database:
             f"SELECT t.* FROM thoughts t {cursor_where} "
             f"ORDER BY {order} LIMIT ?"
         )
-        cursor_params.append(limit)
+        cursor_params.append(-1 if limit is None else max(0, limit))
 
         rows = self.execute(query_sql, tuple(cursor_params)).fetchall()
         thoughts = [Thought.from_row(dict(row)) for row in rows]
@@ -363,26 +447,33 @@ class Database:
         self,
         thought_id: str,
         content: str | None = None,
-        embedding: bytes | None = None,
-        category: str | None = None,
-        confidence: float | None = None,
+        embedding: bytes | None | _Unset = _UNSET,
+        category: str | None | _Unset = _UNSET,
+        confidence: float | None | _Unset = _UNSET,
         needs_review: bool | None = None,
         metadata: dict | None = None,
+        embedding_model: str | None | _Unset = _UNSET,
     ) -> None:
-        """Update specific fields of a thought."""
+        """Update fields and search indexes atomically.
+
+        Omitted nullable fields are preserved; explicit None clears them.
+        """
         sets: list[str] = []
         params: list = []
 
         if content is not None:
             sets.append("content = ?")
             params.append(content)
-        if embedding is not None:
+        if embedding is not _UNSET:
             sets.append("embedding = ?")
             params.append(embedding)
-        if category is not None:
+        if embedding_model is not _UNSET:
+            sets.append("embedding_model = ?")
+            params.append(embedding_model)
+        if category is not _UNSET:
             sets.append("category = ?")
             params.append(category)
-        if confidence is not None:
+        if confidence is not _UNSET:
             sets.append("confidence = ?")
             params.append(confidence)
         if needs_review is not None:
@@ -400,21 +491,23 @@ class Database:
         params.append(thought_id)
 
         conn = self._get_conn()
-        conn.execute(
-            f"UPDATE thoughts SET {', '.join(sets)} WHERE id = ?",
-            tuple(params),
-        )
-        # Sync embedding into vec_thoughts for KNN search
-        if embedding is not None and self.has_vec:
+        with conn:
             conn.execute(
-                "DELETE FROM vec_thoughts WHERE thought_id = ?",
-                (thought_id,),
+                f"UPDATE thoughts SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
             )
-            conn.execute(
-                "INSERT INTO vec_thoughts(thought_id, embedding) VALUES (?, ?)",
-                (thought_id, embedding),
-            )
-        conn.commit()
+            # None removes the old vector; a failed replacement rolls back text/FTS too.
+            if embedding is not _UNSET and self.has_vec:
+                conn.execute(
+                    "DELETE FROM vec_thoughts WHERE thought_id = ?",
+                    (thought_id,),
+                )
+                if embedding is not None:
+                    conn.execute(
+                        """INSERT INTO vec_thoughts(thought_id, embedding)
+                           SELECT id, embedding FROM thoughts WHERE id = ?""",
+                        (thought_id,),
+                    )
 
     def delete_thought(self, thought_id: str) -> str | None:
         """Delete a thought by ID. Returns content preview or None if not found."""
@@ -428,17 +521,27 @@ class Database:
         preview = content[:80] if len(content) > 80 else content
 
         conn = self._get_conn()
-        conn.execute("DELETE FROM thoughts WHERE id = ?", (thought_id,))
-        if self.has_vec:
-            conn.execute("DELETE FROM vec_thoughts WHERE thought_id = ?", (thought_id,))
-        conn.commit()
+        with conn:
+            conn.execute("DELETE FROM thoughts WHERE id = ?", (thought_id,))
+            if self.has_vec:
+                conn.execute("DELETE FROM vec_thoughts WHERE thought_id = ?", (thought_id,))
         return preview
 
     # ------------------------------------------------------------------
     # FTS
     # ------------------------------------------------------------------
 
-    def fts_search(self, query: str, limit: int = 10) -> list[dict]:
+    def fts_search(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        category: str | None = None,
+        entity: str | None = None,
+        after: str | None = None,
+        before: str | None = None,
+        needs_review: bool | None = None,
+    ) -> list[dict]:
         """Search thoughts by keyword using FTS5.
 
         Args:
@@ -448,14 +551,19 @@ class Database:
         Returns:
             List of dicts with thought fields and FTS rank.
         """
+        conditions, params = _thought_filters(
+            category=category, entity=entity, after=after, before=before,
+            needs_review=needs_review,
+        )
+        where = " AND " + " AND ".join(conditions) if conditions else ""
         rows = self.execute(
-            """SELECT t.*, thoughts_fts.rank
+            f"""SELECT t.*, thoughts_fts.rank
                FROM thoughts_fts
                JOIN thoughts t ON t.rowid = thoughts_fts.rowid
-               WHERE thoughts_fts MATCH ?
-               ORDER BY thoughts_fts.rank
+               WHERE thoughts_fts MATCH ? {where}
+               ORDER BY thoughts_fts.rank, t.id DESC
                LIMIT ?""",
-            (query, limit),
+            (query, *params, max(0, limit)),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -518,7 +626,7 @@ class Database:
         self,
         entity_type: str | None = None,
         query: str | None = None,
-        limit: int = 20,
+        limit: int | None = 20,
         sort: str = "last_seen",
     ) -> tuple[list[Entity], int]:
         """List entities with optional filtering.
@@ -562,7 +670,7 @@ class Database:
 
         rows = self.execute(
             f"SELECT * FROM entities {where} ORDER BY {order} LIMIT ?",
-            (*params, limit),
+            (*params, -1 if limit is None else limit),
         ).fetchall()
         entities = [Entity.from_row(dict(row)) for row in rows]
         return entities, total

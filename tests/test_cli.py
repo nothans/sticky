@@ -1,10 +1,11 @@
-"""Tests for the Typer CLI."""
+"""Exercise the retained CLI against isolated storage and local embeddings."""
 
 import json
-import logging
-import warnings
+import struct
 
+import httpx
 import pytest
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from sticky.cli.app import app
@@ -13,447 +14,217 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
-def reset_service(tmp_data_dir, monkeypatch):
-    """Reset service singleton between tests so each test gets a fresh DB."""
-    import sticky.cli.app as mod
+def local_service(monkeypatch):
+    import sticky.cli.app as cli
+    from sticky.core.embeddings import EmbeddingEngine
 
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
-    monkeypatch.setenv("STICKY_OPENROUTER_API_KEY", "test-key")
-    # Suppress HF Hub warnings that pollute captured CLI output
-    monkeypatch.setenv("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
-    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
-    mod._service = None
-
-
-def _parse_json(output: str) -> dict | list:
-    """Extract JSON from CLI output, skipping non-JSON prefix/suffix lines.
-
-    The BertModel LOAD REPORT may be printed to stdout before or after the
-    JSON payload (depending on when the model is lazily initialised), so we
-    use ``raw_decode`` to extract only the first complete JSON value.
-    """
-    # Find the first line that starts JSON ('{' or '[')
-    lines = output.split("\n")
-    start_idx = 0
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            start_idx = i
-            break
-    json_text = "\n".join(lines[start_idx:])
-    decoder = json.JSONDecoder()
-    obj, _ = decoder.raw_decode(json_text)
-    return obj
+    monkeypatch.setattr(EmbeddingEngine, "embed", lambda self, text: struct.pack("384f", *([1.0] + [0.0] * 383)))
+    monkeypatch.setattr(cli, "_service", None)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No cloud request expected")
+    monkeypatch.setattr(httpx.Client, "post", forbidden)
+    monkeypatch.setattr(httpx.AsyncClient, "post", forbidden)
+    yield
+    if cli._service is not None:
+        cli._service.db.close()
+    cli._service = None
 
 
-# ---------------------------------------------------------------------------
-# add
-# ---------------------------------------------------------------------------
+def invoke_json(*args):
+    result = runner.invoke(app, [*args, "--json"])
+    assert result.exit_code == 0, result.output or repr(result.exception)
+    return json.loads(result.output)
 
 
-def test_add_thought():
-    result = runner.invoke(app, ["add", "test thought"])
+def test_command_surface_is_small():
+    command = get_command(app)
+    assert set(command.commands) == {
+        "add", "search", "list", "get", "classify", "update", "delete", "export", "import",
+        "digest", "stats", "privacy", "config", "setup", "tui", "mcp-serve",
+    }
+    for name in ("search", "list", "export"):
+        params = {option.name for option in command.commands[name].params}
+        assert not {"entity", "needs_review", "mode"}.intersection(params)
+    assert "template" not in {option.name for option in command.commands["add"].params}
+    result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "Captured" in result.output
-
-
-def test_add_quiet():
-    result = runner.invoke(app, ["add", "quiet thought", "--quiet"])
-    assert result.exit_code == 0
-    # Should only output the ID (a ULID)
-    assert len(result.output.strip()) > 10
-
-
-def test_add_json_output():
-    result = runner.invoke(app, ["add", "test", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "id" in data
-    assert data["content"] == "test"
-
-
-def test_add_with_template():
-    result = runner.invoke(app, ["add", "meeting notes", "--template", "meeting"])
-    assert result.exit_code == 0
-
-
-def test_add_with_source():
-    result = runner.invoke(app, ["add", "from api", "--source", "api"])
-    assert result.exit_code == 0
-
-
-# ---------------------------------------------------------------------------
-# search
-# ---------------------------------------------------------------------------
-
-
-def test_add_and_search():
-    runner.invoke(app, ["add", "Sarah is leaving the team"])
-    result = runner.invoke(app, ["search", "Sarah"])
-    assert result.exit_code == 0
-    assert "Sarah" in result.output
-
-
-def test_search_no_results():
-    result = runner.invoke(app, ["search", "nonexistentxyzquery"])
-    assert result.exit_code == 0
-    assert "No results" in result.output or "0 results" in result.output or result.output.strip() != ""
-
-
-def test_search_json():
-    runner.invoke(app, ["add", "Python web development"])
-    result = runner.invoke(app, ["search", "Python", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert isinstance(data, list)
-
-
-def test_search_with_limit():
-    runner.invoke(app, ["add", "thought one"])
-    runner.invoke(app, ["add", "thought two"])
-    result = runner.invoke(app, ["search", "thought", "--limit", "1"])
-    assert result.exit_code == 0
-
-
-# ---------------------------------------------------------------------------
-# list
-# ---------------------------------------------------------------------------
-
-
-def test_list():
-    runner.invoke(app, ["add", "thought 1"])
-    result = runner.invoke(app, ["list"])
-    assert result.exit_code == 0
-    assert "thought 1" in result.output
-
-
-def test_list_empty():
-    result = runner.invoke(app, ["list"])
-    assert result.exit_code == 0
-    assert "No thoughts" in result.output
-
-
-def test_list_json():
-    runner.invoke(app, ["add", "json list thought"])
-    result = runner.invoke(app, ["list", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "thoughts" in data
-    assert "total" in data
-
-
-# ---------------------------------------------------------------------------
-# review
-# ---------------------------------------------------------------------------
-
-
-def test_review():
-    # With a test API key, classification fails and thoughts get needs_review=True
-    runner.invoke(app, ["add", "review me"])
-    result = runner.invoke(app, ["review"])
-    assert result.exit_code == 0
-
-
-def test_review_json():
-    runner.invoke(app, ["add", "review json"])
-    result = runner.invoke(app, ["review", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "items" in data
-
-
-# ---------------------------------------------------------------------------
-# classify
-# ---------------------------------------------------------------------------
-
-
-def test_classify():
-    add_result = runner.invoke(app, ["add", "something to classify", "--json"])
-    thought_id = _parse_json(add_result.output)["id"]
-    result = runner.invoke(app, ["classify", thought_id, "--category", "idea"])
-    assert result.exit_code == 0
-    assert "Reclassified" in result.output
-
-
-def test_classify_nonexistent():
-    result = runner.invoke(app, ["classify", "nonexistent-id", "--category", "idea"])
-    assert result.exit_code == 1
-
-
-# ---------------------------------------------------------------------------
-# entities
-# ---------------------------------------------------------------------------
-
-
-def test_entities():
-    result = runner.invoke(app, ["entities"])
-    assert result.exit_code == 0
-
-
-def test_entities_json():
-    result = runner.invoke(app, ["entities", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "entities" in data
-
-
-# ---------------------------------------------------------------------------
-# digest
-# ---------------------------------------------------------------------------
-
-
-def test_digest():
-    runner.invoke(app, ["add", "digest thought"])
-    result = runner.invoke(app, ["digest"])
-    assert result.exit_code == 0
-    assert "Digest" in result.output
-
-
-def test_digest_json():
-    runner.invoke(app, ["add", "digest json thought"])
-    result = runner.invoke(app, ["digest", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "digest" in data
-    assert "period" in data
-
-
-# ---------------------------------------------------------------------------
-# export
-# ---------------------------------------------------------------------------
-
-
-def test_export_json(tmp_path):
-    runner.invoke(app, ["add", "exportable"])
-    result = runner.invoke(
-        app, ["export", "json", "--output", str(tmp_path / "out.json")]
-    )
-    assert result.exit_code == 0
-    assert "Exported" in result.output
-
-
-def test_export_markdown(tmp_path):
-    runner.invoke(app, ["add", "md exportable"])
-    result = runner.invoke(
-        app, ["export", "markdown", "--output", str(tmp_path / "md_out")]
-    )
-    assert result.exit_code == 0
-    assert "Exported" in result.output
-
-
-def test_export_json_output(tmp_path):
-    runner.invoke(app, ["add", "export json flag"])
-    result = runner.invoke(
-        app,
-        ["export", "json", "--output", str(tmp_path / "out2.json"), "--json"],
-    )
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "count" in data
-
-
-# ---------------------------------------------------------------------------
-# import
-# ---------------------------------------------------------------------------
-
-
-def test_import_json(tmp_path):
-    # First export, then import
-    runner.invoke(app, ["add", "importable"])
-    export_path = str(tmp_path / "import_test.json")
-    runner.invoke(app, ["export", "json", "--output", export_path])
-    # Import into same service (will skip duplicates)
-    result = runner.invoke(app, ["import", export_path])
-    assert result.exit_code == 0
-
-
-# ---------------------------------------------------------------------------
-# stats
-# ---------------------------------------------------------------------------
-
-
-def test_stats():
-    result = runner.invoke(app, ["stats"])
-    assert result.exit_code == 0
-    assert "Stats" in result.output
-
-
-def test_stats_json():
-    result = runner.invoke(app, ["stats", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "thoughts" in data
-
-
-# ---------------------------------------------------------------------------
-# update
-# ---------------------------------------------------------------------------
-
-
-def test_update():
-    add_result = runner.invoke(app, ["add", "original content", "--json"])
-    thought_id = _parse_json(add_result.output)["id"]
-    result = runner.invoke(app, ["update", thought_id, "updated content"])
-    assert result.exit_code == 0
-    assert "Updated" in result.output
-
-
-def test_update_nonexistent():
-    result = runner.invoke(app, ["update", "nonexistent-id", "new content"])
-    assert result.exit_code == 1
-
-
-# ---------------------------------------------------------------------------
-# delete
-# ---------------------------------------------------------------------------
-
-
-def test_delete_with_yes():
-    add_result = runner.invoke(app, ["add", "to be deleted", "--json"])
-    thought_id = _parse_json(add_result.output)["id"]
-    result = runner.invoke(app, ["delete", thought_id, "--yes"])
-    assert result.exit_code == 0
-    assert "Deleted" in result.output
-
-
-def test_delete_abort():
-    add_result = runner.invoke(app, ["add", "keep me", "--json"])
-    thought_id = _parse_json(add_result.output)["id"]
-    result = runner.invoke(app, ["delete", thought_id], input="n\n")
-    assert result.exit_code != 0 or "Aborted" in result.output
-
-
-def test_delete_nonexistent():
-    result = runner.invoke(app, ["delete", "nonexistent-id", "--yes"])
-    assert result.exit_code == 1
-
-
-# ---------------------------------------------------------------------------
-# config
-# ---------------------------------------------------------------------------
-
-
-def test_config_show():
-    result = runner.invoke(app, ["config"])
-    assert result.exit_code == 0
-    assert "Configuration" in result.output or "config" in result.output.lower()
-
-
-def test_config_json():
-    result = runner.invoke(app, ["config", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert isinstance(data, dict)
-
-
-def test_config_get():
-    result = runner.invoke(app, ["config", "get", "confidence_threshold"])
-    assert result.exit_code == 0
-    assert "confidence_threshold" in result.output
-
-
-def test_config_get_unknown():
-    result = runner.invoke(app, ["config", "get", "unknown_key_xyz"])
-    assert result.exit_code == 1
-
-
-def test_config_set():
-    result = runner.invoke(app, ["config", "set", "confidence_threshold", "0.8"])
-    assert result.exit_code == 0
-    assert "Set" in result.output
-
-
-def test_config_path():
-    result = runner.invoke(app, ["config", "path"])
-    assert result.exit_code == 0
-    assert "config" in result.output.lower() or len(result.output.strip()) > 0
-
-
-# ---------------------------------------------------------------------------
-# tui
-# ---------------------------------------------------------------------------
-
-
-def test_tui():
-    """Verify the TUI command imports correctly (actual TUI tested in test_tui.py)."""
-    from sticky.tui.app import StickyApp
-
-    assert StickyApp is not None
-    assert StickyApp.TITLE == "sticky"
-
-
-# ---------------------------------------------------------------------------
-# privacy
-# ---------------------------------------------------------------------------
-
-
-def test_privacy():
-    result = runner.invoke(app, ["privacy"])
-    assert result.exit_code == 0
-    assert "LOCAL" in result.output
-
-
-def test_privacy_json():
-    result = runner.invoke(app, ["privacy", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "data_flow" in data
-
-
-# ---------------------------------------------------------------------------
-# actions
-# ---------------------------------------------------------------------------
-
-
-def test_actions():
-    result = runner.invoke(app, ["actions"])
-    assert result.exit_code == 0
-
-
-def test_actions_json():
-    result = runner.invoke(app, ["actions", "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert "actions" in data
-
-
-def test_actions_complete():
-    # Insert an action item via service then complete via CLI
+    assert "schedule" not in result.output
+
+
+def test_capture_read_edit_categorize_and_delete():
+    first = invoke_json("add", "Meeting at 2 pm", "--url", "https://example.org", "--thread", "work")
+    second = invoke_json("add", "Meeting at 3 pm")
+    repeated = invoke_json("add", "Meeting at 2 pm")
+    assert len({first["id"], second["id"], repeated["id"]}) == 3
+    assert first["category"] is None
+    assert "entities" not in first
+    read = invoke_json("get", first["id"])
+    assert read["source_url"] == "https://example.org"
+    assert read["metadata"]["thread"] == "work"
+    categorized = invoke_json("classify", first["id"], "--category", "meeting")
+    assert categorized["category"] == "meeting"
+    edited = invoke_json("update", first["id"], "Meeting at 4 pm")
+    assert edited["content"] == "Meeting at 4 pm"
+    assert edited["category"] is None
+    assert edited["metadata"]["thread"] == "work"
+    assert invoke_json("delete", first["id"], "--yes")["deleted"]
+    missing = runner.invoke(app, ["get", first["id"]])
+    assert missing.exit_code == 1
+
+
+def test_search_filters_list_pagination_and_configured_defaults():
     from sticky.cli.app import get_service
-    from sticky.core.models import ActionItem
+    get_service().config.default_search_limit = 1
+    get_service().config.default_list_limit = 1
+    first = invoke_json("add", "quantum computing notes", "--thread", "science")
+    invoke_json("classify", first["id"], "--category", "reference")
+    invoke_json("add", "quantum mechanics")
+    assert len(invoke_json("search", "quantum")) == 1
+    assert invoke_json("search", "quantum", "--category", "reference")[0]["id"] == first["id"]
+    listing = invoke_json("list")
+    assert len(listing["thoughts"]) == 1 and listing["has_more"]
+    next_page = invoke_json("list", "--cursor", listing["next_cursor"])
+    assert not next_page["has_more"]
+    assert invoke_json("list", "--thread", "science")["thoughts"][0]["id"] == first["id"]
 
-    svc = get_service()
-    action = ActionItem(content="Test action CLI", source_thought_id=None)
-    svc.db.insert_action_item(action)
 
-    result = runner.invoke(app, ["actions", "complete", action.id])
-    assert result.exit_code == 0
-    assert "Completed" in result.output
+def test_export_and_idempotent_json_restore(tmp_path):
+    original = invoke_json("add", "recovery note")
+    target = tmp_path / "notes.json"
+    assert invoke_json("export", "json", "--output", str(target))["count"] == 1
+    assert invoke_json("import", str(target))["skipped"] == 1
+    assert invoke_json("delete", original["id"], "--yes")["deleted"]
+    assert invoke_json("import", str(target))["imported"] == 1
+    assert invoke_json("get", original["id"])["content"] == "recovery note"
+    markdown = tmp_path / "markdown"
+    assert invoke_json("export", "markdown", "--output", str(markdown))["count"] == 1
 
 
-def test_actions_complete_nonexistent():
-    result = runner.invoke(app, ["actions", "complete", "nonexistent-id"])
+def test_repeated_markdown_export_reports_refusal_without_traceback(tmp_path):
+    invoke_json("add", "keep the first export")
+    target = tmp_path / "markdown"
+    invoke_json("export", "markdown", "--output", str(target))
+    before = {path.name: path.read_bytes() for path in target.iterdir()}
+
+    result = runner.invoke(app, ["export", "markdown", "--output", str(target)])
+
     assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "Error: Markdown export requires an empty directory" in result.output
+    assert "Traceback" not in result.output
+    assert {path.name: path.read_bytes() for path in target.iterdir()} == before
 
 
-# ---------------------------------------------------------------------------
-# related
-# ---------------------------------------------------------------------------
+def test_invalid_startup_config_reports_error_without_secret(monkeypatch):
+    monkeypatch.setenv("STICKY_DEFAULT_SEARCH_LIMIT", "garbage")
+    monkeypatch.setenv("STICKY_OPENROUTER_API_KEY", "dummy-startup-secret")
+
+    result = runner.invoke(app, ["config", "--json"])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "Error:" in result.output and "default_search_limit" in result.output
+    assert "Traceback" not in result.output
+    assert "dummy-startup-secret" not in result.output
+    import sticky.cli.app as cli
+    assert cli._service is None
 
 
-def test_related():
-    add_result = runner.invoke(app, ["add", "Python Flask web development", "--json"])
-    thought_id = _parse_json(add_result.output)["id"]
-    runner.invoke(app, ["add", "Django web framework for Python"])
-    result = runner.invoke(app, ["related", thought_id])
+@pytest.mark.parametrize("args", [["add", " "], ["search", "notes", "--limit", "0"],
+                                ["list", "--limit", "-1"], ["update", "missing", "text"],
+                                ["delete", "missing", "--yes"],
+                                ["config", "set", "default_list_limit", "0"],
+                                ["config", "set", "embedding_model", "new-model"]])
+def test_invalid_input_fails(args):
+    result = runner.invoke(app, args)
+    assert result.exit_code != 0
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_config_secret_read_and_write_are_masked(json_output):
+    from sticky.cli.app import get_service
+    get_service().config.openrouter_api_key = "old-dummy-secret"
+    suffix = ["--json"] if json_output else []
+    written = runner.invoke(app, ["config", "set", "openrouter_api_key", "new-dummy-secret", *suffix])
+    assert written.exit_code == 0, written.output
+    for result in (written, runner.invoke(app, ["config", *suffix]),
+                   runner.invoke(app, ["config", "get", "openrouter_api_key", *suffix])):
+        assert "old-dummy-secret" not in result.output
+        assert "new-dummy-secret" not in result.output
+    assert "configured" in written.output
+
+
+def test_setup_masks_key_and_advertises_only_working_commands():
+    result = runner.invoke(app, ["setup", "--api-key", "setup-dummy-secret", "--json"])
     assert result.exit_code == 0
+    assert "setup-dummy-secret" not in result.output
+    assert json.loads(result.output)["api_key"] == "configured"
+    rendered = runner.invoke(app, ["setup"])
+    assert "sticky brief" not in rendered.output
+    mcp = runner.invoke(app, ["setup", "--mcp"])
+    assert "mcpServers" in json.loads(mcp.output)
 
 
-def test_related_json():
-    add_result = runner.invoke(app, ["add", "related json test", "--json"])
-    thought_id = _parse_json(add_result.output)["id"]
-    result = runner.invoke(app, ["related", thought_id, "--json"])
-    assert result.exit_code == 0
-    data = _parse_json(result.output)
-    assert isinstance(data, list)
+def test_digest_requires_key_and_reports_cloud_errors(monkeypatch):
+    from sticky.cli.app import get_service
+    invoke_json("add", "digest source")
+    get_service().config.openrouter_api_key = ""
+    missing = runner.invoke(app, ["digest"])
+    assert missing.exit_code == 1
+    assert "API key" in missing.output
+    get_service().config.openrouter_api_key = "dummy-key"
+    monkeypatch.setattr(get_service().digest_generator, "generate_sync",
+                        lambda thoughts: {"text": "One source note [1]."})
+    assert invoke_json("digest")["thought_count"] == 1
+
+
+def test_local_stats_and_privacy():
+    invoke_json("add", "local count")
+    assert invoke_json("stats")["thoughts"]["total"] == 1
+    info = invoke_json("privacy")
+    assert info["data_flow"]["capture"] == "LOCAL"
+    assert "retention" in info["description"]
+
+
+def test_delete_cancellation_preserves_note():
+    note = invoke_json("add", "keep this")
+    result = runner.invoke(app, ["delete", note["id"]], input="n\n")
+    assert result.exit_code != 0
+    assert invoke_json("get", note["id"])["content"] == "keep this"
+
+
+def test_partial_import_reports_failure_and_keeps_valid_records(tmp_path):
+    source = tmp_path / "partial.json"
+    source.write_text(json.dumps({"thoughts": [
+        {"id": "valid-record", "content": "Keep this restored note"}, {"content": " "},
+    ]}), encoding="utf-8")
+    result = runner.invoke(app, ["import", str(source), "--json"])
+    assert result.exit_code == 1
+    receipt = json.loads(result.output)
+    assert receipt["imported"] == 1 and len(receipt["errors"]) == 1
+    assert invoke_json("get", "valid-record")["content"] == "Keep this restored note"
+
+
+def test_malformed_json_import_reports_clean_error(tmp_path):
+    source = tmp_path / "invalid.json"
+    source.write_text("null", encoding="utf-8")
+    result = runner.invoke(app, ["import", str(source), "--json"])
+    assert result.exit_code == 1 and isinstance(result.exception, SystemExit)
+    assert "thoughts list" in result.output and "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("content,category", [
+    ("[red]literal[/red] note", "draft [/urgent]"),
+    ("draft [/urgent]", "[cyan]literal[/cyan]"),
+])
+def test_list_renders_note_fields_literally(tmp_path, monkeypatch, content, category):
+    import sticky.cli.app as cli
+
+    monkeypatch.setattr(cli.console, "width", 150)
+    source = tmp_path / "literal.json"
+    source.write_text(json.dumps({"thoughts": [{"id": "[id]literal", "content": content, "category": category}]}), encoding="utf-8")
+    invoke_json("import", str(source))
+    result = runner.invoke(app, ["list"])
+    assert result.exit_code == 0, result.exception
+    assert content in result.output and category in result.output
+    assert "[id]literal" in result.output

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from sticky.core.db import Database
+from sticky.core.db import Database, _thought_filters
 from sticky.core.embeddings import EmbeddingEngine
 from sticky.core.models import SearchResult, Thought
 
 
 class HybridSearch:
-    """Combines vector similarity and FTS5 keyword matching with configurable weights.
+    """Fixed hybrid ranking, with component modes available for internal checks.
 
     Supports three modes:
     - ``hybrid`` (default): weighted combination of vector + FTS5
@@ -54,11 +54,17 @@ class HybridSearch:
         Returns:
             List of SearchResult objects sorted by score descending.
         """
-        if not query or not query.strip():
+        if not query or not query.strip() or limit <= 0:
             return []
 
         # Determine effective weights based on mode
         v_weight, f_weight = self._effective_weights(mode)
+        filters = {
+            "category": category, "entity": entity, "after": after,
+            "before": before, "needs_review": needs_review,
+        }
+        # Invalid filters are caller errors, even if an embedding or FTS fails.
+        _thought_filters(**filters)
 
         # Collect scored results keyed by thought ID
         # Each entry: {thought_id: (thought, score, match_type)}
@@ -66,13 +72,18 @@ class HybridSearch:
 
         # --- Vector search ---
         if v_weight > 0:
-            vector_results = self._vector_search(query)
+            try:
+                vector_results = self._vector_search(query, limit=limit, **filters)
+            except Exception:
+                # Search remains usable when the local model cannot load/embed.
+                vector_results = []
+                f_weight = 1.0
             for thought, v_score in vector_results:
                 scored[thought.id] = (thought, v_score * v_weight, "vector")
 
         # --- FTS search ---
         if f_weight > 0:
-            fts_results = self._fts_search(query)
+            fts_results = self._fts_search(query, limit=limit, **filters)
             for thought, f_score in fts_results:
                 if thought.id in scored:
                     # Merge: add FTS score to existing vector score
@@ -85,25 +96,9 @@ class HybridSearch:
                 else:
                     scored[thought.id] = (thought, f_score * f_weight, "fts")
 
-        # If both sources contributed but mode is not hybrid, set match_type
-        if mode == "semantic":
-            scored = {
-                tid: (t, s, "vector") for tid, (t, s, _) in scored.items()
-            }
-        elif mode == "keyword":
-            scored = {
-                tid: (t, s, "fts") for tid, (t, s, _) in scored.items()
-            }
-
-        # --- Apply post-search filters ---
-        filtered = self._apply_filters(
-            scored, category=category, entity=entity,
-            after=after, before=before, needs_review=needs_review,
-        )
-
         # --- Sort by score descending and apply limit ---
-        filtered.sort(key=lambda x: x[1], reverse=True)
-        top = filtered[:limit]
+        ranked = sorted(scored.values(), key=lambda x: (x[1], x[0].id), reverse=True)
+        top = ranked[:limit]
 
         return [
             SearchResult(thought=thought, score=round(score, 6), match_type=match_type)
@@ -119,35 +114,47 @@ class HybridSearch:
         else:  # hybrid
             return (self.vector_weight, self.fts_weight)
 
-    def _vector_search(self, query: str) -> list[tuple[Thought, float]]:
+    def _vector_search(
+        self, query: str, limit: int = 10, **filters,
+    ) -> list[tuple[Thought, float]]:
         """KNN search using sqlite-vec (or Python fallback).
 
         Returns list of (Thought, normalized_score) pairs.
         """
         query_embedding = self.engine.embed(query)
+        if not isinstance(query_embedding, bytes) or len(query_embedding) != 384 * 4:
+            raise ValueError("Search requires a 384-dimensional MiniLM embedding")
+        conditions, params = _thought_filters(**filters)
+        candidate_limit = max(200, limit)
 
-        if self.db.has_vec:
+        # sqlite-vec's fast KNN query ranks globally. For filtered searches,
+        # score only eligible rows so unrelated global hits cannot hide them.
+        if self.db.has_vec and not conditions and candidate_limit < 4096:
             rows = self.db.execute(
                 """SELECT v.thought_id, v.distance, t.*
                    FROM vec_thoughts v
                    JOIN thoughts t ON t.id = v.thought_id
                    WHERE v.embedding MATCH ?
-                     AND v.k = 200
+                     AND v.k = ?
                    ORDER BY v.distance""",
-                (query_embedding,),
+                (query_embedding, candidate_limit + 1),
             ).fetchall()
 
             if not rows:
                 return []
 
-            return [
-                (Thought.from_row(dict(row)), max(0.0, 1.0 - row["distance"]))
-                for row in rows
-            ]
+            def score(row):
+                return min(1.0, max(0.0, 1.0 - row["distance"]))
+            # A tied cutoff can hide higher IDs in the same relevance group.
+            # Reuse complete scoring only for those ties; otherwise KNN is enough.
+            if len(rows) <= candidate_limit or score(rows[-2]) > score(rows[-1]):
+                return [(Thought.from_row(dict(row)), score(row)) for row in rows[:candidate_limit]]
 
-        # Fallback: Python-loop cosine similarity
+        # No ID IN list: the number of eligible rows never consumes SQL parameters.
+        where = " AND " + " AND ".join(conditions) if conditions else ""
         rows = self.db.execute(
-            "SELECT * FROM thoughts WHERE embedding IS NOT NULL"
+            f"SELECT t.* FROM thoughts t WHERE t.embedding IS NOT NULL {where}",
+            tuple(params),
         ).fetchall()
         if not rows:
             return []
@@ -155,17 +162,23 @@ class HybridSearch:
         results: list[tuple[Thought, float]] = []
         for row in rows:
             thought = Thought.from_row(dict(row))
+            if len(thought.embedding) != len(query_embedding):
+                continue  # Keep older incompatible embeddings available through FTS.
             sim = self.engine.cosine_similarity(query_embedding, thought.embedding)
-            results.append((thought, max(0.0, sim)))
+            results.append((thought, min(1.0, max(0.0, sim))))
         return results
 
-    def _fts_search(self, query: str) -> list[tuple[Thought, float]]:
+    def _fts_search(
+        self, query: str, limit: int = 10, **filters,
+    ) -> list[tuple[Thought, float]]:
         """Perform FTS5 keyword search and normalize BM25 scores to 0-1.
 
         Returns list of (Thought, normalized_score) pairs.
         """
         try:
-            fts_rows = self.db.fts_search(query, limit=100)
+            # Public search accepts ordinary text, not the FTS expression language.
+            literal_query = " AND ".join('"' + term.replace('"', '""') + '"' for term in query.split())
+            fts_rows = self.db.fts_search(literal_query, limit=max(100, limit), **filters)
         except Exception:
             # FTS can fail on malformed queries; return empty gracefully
             return []
@@ -197,43 +210,3 @@ class HybridSearch:
             results.append((thought, normalized))
 
         return results
-
-    def _apply_filters(
-        self,
-        scored: dict[str, tuple[Thought, float, str]],
-        category: str | None = None,
-        entity: str | None = None,
-        after: str | None = None,
-        before: str | None = None,
-        needs_review: bool | None = None,
-    ) -> list[tuple[Thought, float, str]]:
-        """Apply post-search filters to scored results.
-
-        Returns filtered list of (thought, score, match_type) tuples.
-        """
-        # If entity filter is set, get the set of thought IDs for that entity
-        entity_thought_ids: set[str] | None = None
-        if entity is not None:
-            rows = self.db.execute(
-                """SELECT em.thought_id FROM entity_mentions em
-                   JOIN entities e ON e.id = em.entity_id
-                   WHERE e.name = ? COLLATE NOCASE""",
-                (entity,),
-            ).fetchall()
-            entity_thought_ids = {row["thought_id"] for row in rows}
-
-        filtered: list[tuple[Thought, float, str]] = []
-        for thought, score, match_type in scored.values():
-            if category is not None and thought.category != category:
-                continue
-            if entity_thought_ids is not None and thought.id not in entity_thought_ids:
-                continue
-            if after is not None and thought.created_at <= after:
-                continue
-            if before is not None and thought.created_at >= before:
-                continue
-            if needs_review is not None and thought.needs_review != needs_review:
-                continue
-            filtered.append((thought, score, match_type))
-
-        return filtered

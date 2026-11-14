@@ -28,9 +28,6 @@ htmlcov/
 Thumbs.db
 desktop.ini
 
-# uv
-uv.lock
-
 # sticky data (local user data — never commit)
 config.toml
 sticky.db

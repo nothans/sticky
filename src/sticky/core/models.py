@@ -184,19 +184,6 @@ class ActionItem(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ClassificationResult(BaseModel):
-    """LLM classification output for a thought."""
-
-    category: str
-    confidence: float
-    topics: list[str] = Field(default_factory=list)
-    people: list[str] = Field(default_factory=list)
-    projects: list[str] = Field(default_factory=list)
-    concepts: list[str] = Field(default_factory=list)
-    actions: list[str] = Field(default_factory=list)
-    source_url: str | None = None
-
-
 class SearchResult(BaseModel):
     """A search result pairing a thought with a relevance score."""
 

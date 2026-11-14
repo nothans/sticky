@@ -1,363 +1,195 @@
-# sticky
+# Sticky
 
-A local-first personal memory system. Capture thoughts with zero friction, let AI organize them, retrieve with semantic search, review with daily digests.
+A small personal memory tool. Capture notes, find them with local semantic and
+keyword search, edit or delete them, and recover them from a backup.
 
-Your data stays on your machine. Embeddings run locally. Classification and digests use OpenRouter (configurable).
+Python 3.11+. Package: `sticky-brain`; command: `sticky`. Alpha, under active development.
 
-## Install
+## Start
 
-```bash
-# With pip (any OS)
-pip install sticky-brain
-
-# Or with uv (faster)
-uv tool install sticky-brain
-
-# Or from source
-git clone https://github.com/nothans/sticky.git
-cd sticky
-pip install -e .
+```powershell
+uv sync --locked
+uv run --locked sticky setup
+uv run --locked sticky add "Meeting with Sarah at 2 pm tomorrow"
+uv run --locked sticky add "Meeting moved to 3 pm tomorrow"
+uv run --locked sticky search "meeting with Sarah"
+uv run --locked sticky tui
 ```
 
-After install, the `sticky` command is available globally.
+Capture, editing, and search work without an API key. Every capture is a separate
+record, including identical text. Semantic similarity never discards a new note.
+The fixed local model is `all-MiniLM-L6-v2` (384 dimensions). Its files download on
+first use; later runs use the local cache. If embedding is unavailable, raw notes
+still save and remain searchable by keyword. If embedding fails during an edit,
+the saved text has no stale vector or classification. A database write failure
+rolls the edit back, preserving the original note and its indexes.
+For offline use after the model has downloaded, set `HF_HUB_OFFLINE=1`.
+Sticky then loads model files from the cache only.
+If sqlite-vec is unavailable, keyword search remains usable. When it becomes
+available again, the vector index rebuilds from the current notes so edits and
+deletions made during the outage cannot leave stale semantic results.
 
-## Quick Start
+## Commands
 
-```bash
-# 1. Run setup (creates data directory, shows MCP config)
-sticky setup
+All data commands support `--json`. Use `sticky COMMAND --help` for options.
 
-# 2. Set your OpenRouter API key (for classification + digests)
-sticky setup --api-key sk-or-v1-your-key
+| Command | Purpose |
+| --- | --- |
+| `add "text"` | Capture locally; optional `--url`, `--source`, and `--thread` |
+| `search "query"` | One default semantic/keyword search; optional category/date filters |
+| `list` | List notes; optional category/date/thread filters and cursor pagination |
+| `get ID` | Read a complete note |
+| `update ID "text"` | Replace text locally |
+| `delete ID` | Delete a note, with confirmation; `--yes` skips it |
+| `classify ID --category CATEGORY` | Set a category manually; category is free text |
+| `export json --output notes.json` | Export thought records for JSON restoration |
+| `export markdown --output notes` | Write readable files to a new or empty directory |
+| `import notes.json` | Restore thought IDs and original metadata |
+| `stats` | Local note count and paths |
+| `privacy` | Describe the active data flow |
+| `config` | View masked settings; local `get`, `set`, and `path` subcommands |
+| `digest` | Optional, explicitly requested cloud summary |
+| `setup` | Prepare local storage; `--mcp` prints client configuration |
+| `tui` | Open the terminal interface |
+| `mcp-serve` | Run the MCP server over stdio |
 
-# 3. Capture your first thought
-sticky add "Sarah mentioned she wants to transfer to the platform team"
+Search treats query text literally for keyword matching, including punctuation
+such as `C++` and `alpha-beta`. List cursors are opaque: pass `next_cursor` back
+with the same filters and sort direction. Timestamps tied across restored notes
+are ordered by ID; the final page has `has_more: false`.
+Date filters compare instants across timezone offsets and use exclusive bounds.
+Date-only values and datetimes without a timezone mean UTC. Invalid bounds fail
+clearly. Legacy notes with malformed dates remain visible without date filters.
 
-# 4. Search semantically
-sticky search "career changes"
+The TUI has Home, Search, and About. Capture keeps the draft until saving succeeds.
+Open a note to edit, delete, or set its category. Escape returns from Search to
+Home, and from a note to its previous view. Displayed shortcuts describe available
+actions; no cloud work runs on launch.
 
-# 5. See what you've captured
-sticky stats
+## Smaller Alpha surface
 
-# 6. Generate a daily digest
-sticky digest
+Automatic classification, entity/action tracking, review queues, resurfacing,
+synthesis, scheduling, model selection, and search-mode selectors have been
+removed from the active interfaces. Existing SQLite history remains stored and
+can be recovered through a full database backup. No automatic review expiry runs
+on startup. Older configuration keys for these features are ignored.
 
-# 7. Get a fast morning briefing (no LLM, instant)
-sticky brief
+## Settings and optional cloud digests
+
+Settings load at startup: `STICKY_` environment variables override local
+`config.toml`, which overrides defaults. `sticky config path` locates the file.
+Only these settings remain:
+
+| Key | Default |
+| --- | --- |
+| `data_dir` | `%LOCALAPPDATA%\sticky` on Windows; `~/.local/share/sticky` elsewhere |
+| `default_search_limit` | 10 |
+| `default_list_limit` | 20 |
+| `openrouter_api_key` | Empty; optional |
+| `openrouter_model` | `anthropic/claude-sonnet-4.6` |
+
+Local setting changes apply to the next session. Numeric limits must be positive.
+API keys are masked in displayed settings and mutation receipts; a configured key
+is stored in your local TOML file unless supplied through the environment.
+
+```powershell
+uv run sticky config set default_search_limit 5
+uv run sticky config set openrouter_api_key YOUR_KEY
+uv run sticky digest --period week
 ```
 
-Get an OpenRouter key at [openrouter.ai/keys](https://openrouter.ai/keys). Sticky works without a key (capture + search still function), but classification, entity extraction, and digest generation require it.
+A digest requires a configured key and an explicit request. Without a key, it
+makes no cloud request. Select at most 1,000 notes using the period or `--since`;
+oversized selections fail clearly instead of silently omitting notes. A returned
+digest includes the selected thought IDs. Cloud failure leaves notes unchanged.
 
-### Connect to Claude Code
+Capture, editing, storage, and search keep note text on your machine. An explicit
+digest sends the selected notes to OpenRouter and the chosen model provider.
+Provider logging and retention policies vary; this app does not enforce Zero Data
+Retention routing. See [OpenRouter provider logging](https://openrouter.ai/docs/guides/privacy/provider-logging)
+and [Zero Data Retention](https://openrouter.ai/docs/guides/features/zdr).
 
-```bash
-# Print MCP config JSON
-sticky setup --mcp
+## Recovery
 
-# Or manually add to your Claude Code MCP settings:
-# Command: sticky
-# Args: mcp-serve
+JSON restores thought IDs, content, timestamps, category, source URL, and metadata;
+embeddings regenerate locally. Existing IDs are skipped. Plain JSON notes without
+IDs become new captures. Use `--dry-run` to validate without writing. Malformed
+records are reported while valid records continue; CLI imports exit with status
+1 if any records fail, including in previews. JSON exports replace an existing
+backup only after a complete write and refuse Sticky's active database and
+configuration paths. JSON does
+not restore historical entity links, actions/completions, aliases, or digests.
+Markdown is readable export; importing it captures text and is not a faithful
+record restoration format. Export refuses a nonempty Markdown directory.
+
+For complete database recovery, use SQLite's backup facility, which safely copies
+a committed snapshot even while Sticky has the database open. From this checkout,
+the following PowerShell example writes a new file in your home directory:
+
+```powershell
+@'
+import sqlite3
+from pathlib import Path
+from sticky.core.config import get_config
+
+source = get_config().db_path.resolve()
+destination = Path.home() / "sticky-backup.db"
+if destination.exists():
+    raise SystemExit("Choose a new backup destination; that file already exists")
+with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as src:
+    with sqlite3.connect(destination) as dst:
+        src.backup(dst)
+print(destination)
+'@ | uv run python -
 ```
 
-## What It Does
+To check recovery, stop Sticky and restore into a fresh directory. This preserves
+the original database. Choose a different directory name if it already exists.
 
-**Capture** a thought in natural language. No categories, no tags, no folders to choose.
-
-**AI classifies** it automatically (idea, meeting, person, action, project, reference, journal) with a confidence score. Low-confidence items are flagged for your review.
-
-**Entities are extracted** (people, projects, concepts) and tracked across all your thoughts. Search by person to see everything you know about them.
-
-**Semantic search** finds thoughts by meaning, not just keywords. "career changes" finds "Sarah is thinking about leaving the team" even though they share no words.
-
-**Daily digest** summarizes your captures by topic, extracts action items, lists people mentioned, and resurfaces a related older thought you might have forgotten.
-
-**Synthesize** everything you know about a person, project, or concept on demand. "What do I know about Sarah?" returns a coherent narrative across all linked thoughts.
-
-## Usage Examples
-
-### Capture a meeting note
-```bash
-sticky add "1:1 with Sarah — she confirmed she wants to move to platform team. Asked about timeline. I said I'd talk to the lead this week."
-```
-AI classifies as "meeting", extracts Sarah as a person entity, and creates action items.
-
-### Research a topic
-```bash
-sticky add "Nate Jones says zero-friction capture is essential. If it takes more than 5 seconds, you won't do it." \
-  --url "https://youtube.com/watch?v=..." \
-  --thread "second-brain-research"
-```
-Tags the source URL for attribution and groups captures into a research thread.
-
-### Search by meaning
-```bash
-sticky search "who is thinking about leaving?"
-# Finds: "Sarah mentioned she's thinking about leaving the team..."
-
-sticky search "API compatibility" --mode keyword
-# Fast exact-match search via FTS5
-
-sticky search "architecture decisions" --category meeting
-# Semantic search filtered to meeting notes only
+```powershell
+$restoreDir = Join-Path $env:LOCALAPPDATA 'sticky-restored'
+New-Item -ItemType Directory -Path $restoreDir -ErrorAction Stop
+Copy-Item -LiteralPath (Join-Path $env:USERPROFILE 'sticky-backup.db') -Destination (Join-Path $restoreDir 'sticky.db')
+$env:STICKY_DATA_DIR = $restoreDir
+uv run sticky list --json
+uv run sticky search "a note you expect"
 ```
 
-### Synthesize what you know
-```bash
-sticky synthesize "Sarah"
-# Returns a multi-paragraph narrative of everything you know about Sarah,
-# with numbered references to source thoughts
+The database backup retains notes, FTS/vector indexes, and existing aliases,
+mentions, completed actions, and digest history. TOML settings are a separate file;
+copy them separately if needed. Remove the temporary `STICKY_DATA_DIR` environment
+override or set it back to your usual location after the check.
 
-sticky synthesize "event sourcing"
-# Works for concepts too
-```
+## MCP
 
-### Morning routine
-```bash
-sticky brief
-# Instant (no LLM): new thought count, action items, entity pulse,
-# resurfaced older thought — under 2 seconds
-
-sticky digest
-# AI-generated summary: topics, action items, people mentioned
-```
-
-### Track action items
-```bash
-sticky actions              # list open actions
-sticky actions complete ID  # mark one done
-```
-
-### Research threads
-```bash
-sticky add "PARA organizes by actionability, not topic" --thread "pkm-research"
-sticky add "Zettelkasten is link-forward vs search-forward" --thread "pkm-research"
-sticky list --thread "pkm-research"  # see just this thread
-```
-
-### Batch operations
-```bash
-sticky reclassify --unclassified    # re-run AI on unclassified thoughts
-sticky reclassify --below 0.5       # re-run on low-confidence thoughts
-```
-
-## Three Interfaces
-
-### CLI
-
-Every command supports `--json` for scripting.
-
-```bash
-sticky add "thought text"                # capture
-sticky add "notes" -t meeting --url URL  # with template + source URL
-sticky add "idea" --thread "research"    # with research thread
-sticky search "query"                    # hybrid semantic + keyword
-sticky search "term" --mode keyword      # keyword-only (fastest)
-sticky list                              # browse all thoughts
-sticky list --category meeting           # filter by category
-sticky list --thread "research"          # filter by thread
-sticky entities --type person            # browse tracked people
-sticky entities --type concept           # browse tracked concepts
-sticky digest                            # daily summary
-sticky digest --period week              # weekly summary
-sticky brief                             # fast morning briefing
-sticky synthesize "Sarah"                # synthesize entity knowledge
-sticky review                            # low-confidence items
-sticky reclassify --unclassified         # batch re-classify
-sticky classify <id> -c action           # manually reclassify
-sticky related <id>                      # find similar thoughts
-sticky actions                           # list action items
-sticky actions complete <id>             # mark action done
-sticky export markdown                   # export to markdown files
-sticky export json                       # export to JSON
-sticky import ./notes/                   # import from files
-sticky stats                             # system info + counts
-sticky privacy                           # what's local vs cloud
-sticky config                            # view all settings
-sticky config set key value              # change a setting
-sticky schedule digest --time 08:30      # schedule daily digest
-sticky schedule list                     # show active schedules
-sticky tui                               # terminal UI
-```
-
-### MCP Server
-
-Sticky exposes 19 tools, 5 resources, and 4 prompts for use with Claude Code, Cursor, or any MCP-compatible AI tool.
-
-Configure in `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "sticky": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/sticky", "python", "-m", "sticky.mcp.server"]
-    }
-  }
-}
-```
-
-**Tools (19):** `sticky_capture`, `sticky_search`, `sticky_list`, `sticky_review`, `sticky_classify`, `sticky_entities`, `sticky_digest`, `sticky_export`, `sticky_import`, `sticky_stats`, `sticky_update`, `sticky_delete`, `sticky_config`, `sticky_related`, `sticky_privacy`, `sticky_actions`, `sticky_reclassify`, `sticky_brief`, `sticky_synthesize`
-
-**Resources (5):** `sticky://stats`, `sticky://brief`, `sticky://entities/people`, `sticky://entities/concepts`, `sticky://privacy`
-
-**Prompts (4):** `research_session`, `daily_review`, `prepare_for_meeting`, `weekly_review`
-
-#### MCP Usage Examples
-
-With Claude Code or any MCP client:
-
-```
-"Capture this: Sarah mentioned she's blocked on the auth PR"
-→ sticky_capture
-
-"What do I know about Marcus?"
-→ sticky_synthesize("Marcus")
-
-"Find my notes about API compatibility"
-→ sticky_search("API compatibility")
-
-"Prepare me for my meeting with Sarah"
-→ prepare_for_meeting("Sarah") prompt
-
-"Start a research session on knowledge graphs"
-→ research_session("knowledge graphs") prompt
-
-"Give me my morning brief"
-→ sticky_brief
-```
-
-### TUI
-
-Terminal UI built with [Textual](https://textual.textualize.io/). 8 views: Home, Search, Detail, Review, Entities, Digest, Stats, About.
-
-```bash
-sticky tui
-```
-
-**Key bindings:** `/` Search, `G` Digest, `R` Review, `F` Filter, `Ctrl+R` Refresh, `Ctrl+K` Command Palette, `Q` Quit
-
-## How It Works
-
-```
-Capture Input
-    |
-    v
-Embedding (local, sentence-transformers, ~100ms)
-    |
-    v
-Classification + Entity Extraction (OpenRouter, ~1s)
-    |     Extracts: category, people, projects, concepts, actions, source_url
-    v
-sqlite-vec KNN Index + FTS5 Keyword Index
-    |
-    v
-SQLite (thoughts + entities + entity_mentions + action_items + digests)
-    |
-    v
-Hybrid Search (0.6 vector + 0.4 keyword, sqlite-vec native)
-    |
-    v
-Related Thoughts (entity co-occurrence + recency boost + cosine similarity)
-    |
-    v
-Daily Digest / Morning Brief / Entity Synthesis (on demand)
-```
-
-**Storage:** Single SQLite file at `~/.local/share/sticky/sticky.db` (Linux/macOS) or `%LOCALAPPDATA%\sticky\sticky.db` (Windows).
-
-**Embeddings:** `all-MiniLM-L6-v2` runs entirely on your machine. 384-dimensional vectors, ~80MB model downloaded on first use.
-
-**Vector Search:** sqlite-vec handles KNN queries natively with cosine distance. No Python loops — searches stay fast at any scale.
-
-**LLM:** `anthropic/claude-sonnet-4.6` via OpenRouter for classification, digest generation, and entity synthesis. Stateless API calls — OpenRouter does not store your data.
-
-**Search:** Hybrid of sqlite-vec cosine similarity (semantic meaning) and FTS5 (exact keywords). Configurable weights (default 0.6/0.4).
-
-## Configuration
-
-Copy `config.example.toml` to your config directory:
-
-```bash
-# Linux/macOS
-cp config.example.toml ~/.config/sticky/config.toml
-
-# Windows
-copy config.example.toml %APPDATA%\sticky\config.toml
-```
-
-Or configure via CLI:
-
-```bash
-sticky config set openrouter_model anthropic/claude-sonnet-4.6
-sticky config set confidence_threshold 0.6
-sticky config set search_mode hybrid
-```
-
-Or via environment variables (highest precedence):
-
-```bash
-export STICKY_OPENROUTER_API_KEY=sk-or-v1-...
-export STICKY_OPENROUTER_MODEL=anthropic/claude-sonnet-4.6
-```
-
-## Privacy
-
-| Component | Location | Details |
-|-----------|----------|---------|
-| Embeddings | **LOCAL** | sentence-transformers runs on your machine |
-| Vector Search | **LOCAL** | sqlite-vec runs native KNN queries |
-| Classification | **CLOUD** | Thought text sent to OpenRouter for categorization |
-| Digest/Synthesis | **CLOUD** | Thought text sent to OpenRouter for summarization |
-| Storage | **LOCAL** | SQLite file on your machine |
-
-Run `sticky privacy` for full details. OpenRouter API calls are stateless — your data is not stored by the provider.
-
-## Data Portability
-
-Your data is never locked in:
-
-```bash
-# Export everything to markdown (one file per thought, YAML frontmatter)
-sticky export markdown -o ./my-backup/
-
-# Export to JSON
-sticky export json -o ./backup.json
-
-# Import from any format
-sticky import ./notes/          # auto-detect format
-sticky import backup.json       # JSON
-sticky import ./obsidian-vault/  # markdown files
-```
-
-The SQLite database is a single file you can inspect directly:
-
-```bash
-sqlite3 ~/.local/share/sticky/sticky.db "SELECT content FROM thoughts ORDER BY created_at DESC LIMIT 5"
-```
+Run `sticky setup --mcp` for a configuration using your installed executable.
+The server exposes 13 tools: `sticky_capture`, `sticky_search`, `sticky_list`,
+`sticky_get`, `sticky_classify`, `sticky_update`, `sticky_delete`, `sticky_export`,
+`sticky_import`, `sticky_digest`, `sticky_stats`, `sticky_config`, `sticky_privacy`.
+Configuration is read-only over MCP. Resources: `sticky://stats` and
+`sticky://privacy`. The `research_session` prompt uses capture and search.
+The server uses the current MCP v2 SDK, with structured JSON tool results and
+annotations describing reads, writes, and cloud access. Expected input and file
+errors return tool errors that clients can act on. Older MCP clients can still
+use the same tool names over stdio.
 
 ## Development
 
-```bash
-# Install with dev dependencies
-uv sync --dev
-
-# Run tests (340+ tests)
-uv run pytest
-
-# Run specific test file
-uv run pytest tests/test_search.py -v
-
-# Run with coverage
-uv run pytest --cov=sticky
+```powershell
+uv sync --locked --extra dev
+uv run --locked --extra dev pytest
+uv build --no-sources
 ```
 
-## Tech Stack
+The tracked `uv.lock` records the tested package versions for development and CI.
+To deliberately refresh dependencies, run `uv lock --upgrade`, then
+`uv sync --locked --extra dev` and the core tests. Major SDK versions are bounded
+in `pyproject.toml` so upgrades happen deliberately. Python 3.11 remains supported;
+the lock selects compatible NumPy/SciPy versions for that interpreter.
 
-- **Python 3.11+** with [uv](https://docs.astral.sh/uv/)
-- **SQLite** + [sqlite-vec](https://github.com/asg017/sqlite-vec) for native vector KNN search + FTS5 for keyword search
-- **sentence-transformers** (all-MiniLM-L6-v2) for local embeddings
-- **OpenRouter** for LLM classification, digest generation, and entity synthesis
-- **Typer** + **Rich** for CLI
-- **Textual** for TUI
-- **FastMCP** for MCP server (tools, resources, prompts)
-- **Pydantic v2** for data models
+SQLite uses FTS5 and sqlite-vec. CLI (Typer), MCP (MCPServer), and TUI (Textual) call
+the same service. Core preservation/failure regressions use isolated databases;
+retrieval checks also use the real local model. Core feature tests cover capture,
+search, editing, deletion, and recovery; they do not establish daily usefulness.
+
+License: MIT.

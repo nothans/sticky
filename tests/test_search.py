@@ -1,10 +1,14 @@
 """Tests for the hybrid search engine."""
 
+import math
+import sqlite3
+import struct
+
 import pytest
 
 from sticky.core.db import Database
 from sticky.core.embeddings import EmbeddingEngine
-from sticky.core.models import Thought, SearchResult
+from sticky.core.models import Entity, EntityMention, Thought, SearchResult
 from sticky.core.search import HybridSearch
 
 
@@ -171,3 +175,155 @@ def test_hybrid_deduplicates(populated_db, search):
     results = search.search("API", mode="hybrid")
     thought_ids = [r.thought.id for r in results]
     assert len(thought_ids) == len(set(thought_ids)), "Duplicate thought IDs found"
+
+
+def _embedding(first: float = 1.0) -> bytes:
+    return struct.pack("384f", first, math.sqrt(1.0 - first ** 2), *([0.0] * 382))
+
+
+@pytest.fixture
+def deterministic_engine():
+    """Known rankings for retrieval correctness, without loading/downloading a model."""
+    class Engine:
+        def embed(self, query):
+            return _embedding()
+
+        cosine_similarity = staticmethod(EmbeddingEngine.cosine_similarity)
+    return Engine()
+
+
+@pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+@pytest.mark.parametrize("filter_name", ["category", "entity", "date", "needs_review"])
+def test_filters_find_eligible_notes_beyond_global_candidate_caps(
+    db, deterministic_engine, mode, filter_name,
+):
+    for i in range(210):
+        db.insert_thought(Thought(
+            content="needle needle needle", embedding=_embedding(),
+            category="other", created_at="2023-01-01T00:00:00+00:00",
+        ))
+    target = Thought(
+        content="needle among several other words", embedding=_embedding(0.5),
+        category="work", created_at="2024-06-01T00:00:00+00:00", needs_review=True,
+    )
+    db.insert_thought(target)
+    entity = Entity(name="Alice", entity_type="person")
+    db.insert_entity(entity)
+    db.insert_entity_mention(EntityMention(entity_id=entity.id, thought_id=target.id))
+
+    # The old unfiltered keyword cap genuinely excludes this row.
+    assert target.id not in {row["id"] for row in db.fts_search("needle", limit=100)}
+    filters = {
+        "category": {"category": "work"},
+        "entity": {"entity": "alice"},
+        "date": {"after": "2024-01-01", "before": "2025-01-01"},
+        "needs_review": {"needs_review": True},
+    }[filter_name]
+    results = HybridSearch(db, deterministic_engine).search(
+        "needle", limit=1, mode=mode, **filters,
+    )
+    assert [result.thought.id for result in results] == [target.id]
+
+
+@pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+def test_requested_limits_can_exceed_old_candidate_caps(db, deterministic_engine, mode):
+    for i in range(225):
+        db.insert_thought(Thought(content=f"needle note {i}", embedding=_embedding()))
+    results = HybridSearch(db, deterministic_engine).search("needle", limit=220, mode=mode)
+    assert len(results) == 220
+    assert len({result.thought.id for result in results}) == 220
+
+
+def test_filtered_search_avoids_parameter_per_eligible_note(db, deterministic_engine):
+    for i in range(1200):
+        db.insert_thought(Thought(
+            content=f"needle work {i}", category="work", embedding=_embedding(),
+        ))
+    # Limits eligibility SQL to a few bindings even with 1,200 matching records.
+    conn = db._get_conn()
+    previous = conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 8)
+    try:
+        results = HybridSearch(db, deterministic_engine).search(
+            "needle", category="work", limit=1200,
+        )
+        assert len(results) == 1200
+    finally:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+
+def test_search_falls_back_to_keywords_when_model_unavailable(db, deterministic_engine, monkeypatch):
+    thought = Thought(content="passport renewal")
+    db.insert_thought(thought)
+    def unavailable(query):
+        raise OSError("Cached model unavailable")
+    monkeypatch.setattr(deterministic_engine, "embed", unavailable)
+    results = HybridSearch(db, deterministic_engine).search("passport")
+    assert [result.thought.id for result in results] == [thought.id]
+    assert results[0].match_type == "fts"
+    assert results[0].score == 1.0
+
+
+@pytest.mark.parametrize("embedding", [None, b"invalid", struct.pack("768f", *([1.0] * 768))])
+def test_search_falls_back_on_unsupported_query_embedding(
+    db, deterministic_engine, monkeypatch, embedding,
+):
+    thought = Thought(content="passport renewal")
+    db.insert_thought(thought)
+    monkeypatch.setattr(deterministic_engine, "embed", lambda query: embedding)
+    results = HybridSearch(db, deterministic_engine).search("passport")
+    assert [result.thought.id for result in results] == [thought.id]
+    assert results[0].match_type == "fts"
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_nonpositive_limit_returns_no_results(db, deterministic_engine, limit):
+    db.insert_thought(Thought(content="needle"))
+    assert HybridSearch(db, deterministic_engine).search("needle", limit=limit) == []
+
+
+@pytest.mark.parametrize("query", ["C++", "alpha-beta"])
+def test_keyword_fallback_treats_punctuation_as_literal(db, deterministic_engine, monkeypatch, query):
+    note = Thought(content="Use C++ for the helper; alpha-beta is our codename.")
+    db.insert_thought(note)
+    def unavailable(text):
+        raise OSError("Model unavailable")
+    monkeypatch.setattr(deterministic_engine, "embed", unavailable)
+    assert HybridSearch(db, deterministic_engine).search(query)[0].thought.id == note.id
+
+
+def test_keyword_fallback_ties_keep_final_order_beyond_cap(db, deterministic_engine, monkeypatch):
+    for index in range(150):
+        db.insert_thought(Thought(id=f"note-{index:04d}", content="daily standup"))
+    def unavailable(text):
+        raise OSError("Model unavailable")
+    monkeypatch.setattr(deterministic_engine, "embed", unavailable)
+    results = HybridSearch(db, deterministic_engine).search("standup", limit=3)
+    assert [result.thought.id for result in results] == ["note-0149", "note-0148", "note-0147"]
+
+
+@pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+def test_search_offset_date_filters_keep_only_eligible_notes(db, deterministic_engine, mode):
+    for note_id, timestamp in [
+        ("earlier", "2026-10-07T12:00:00+02:00"),
+        ("later", "2026-10-07T11:00:00+00:00"),
+    ]:
+        db.insert_thought(Thought(id=note_id, content="needle", created_at=timestamp, embedding=_embedding()))
+    search = HybridSearch(db, deterministic_engine)
+    results = search.search("needle", mode=mode, after="2026-10-07T12:30:00+02:00")
+    assert [result.thought.id for result in results] == ["later"]
+
+
+@pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+def test_search_invalid_date_filter_is_not_silently_empty(db, deterministic_engine, mode):
+    with pytest.raises(ValueError, match="after"):
+        HybridSearch(db, deterministic_engine).search("needle", mode=mode, after="invalid")
+
+
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_vector_cutoff_ties_do_not_depend_on_import_order(db, deterministic_engine, descending, mode):
+    indices = range(249, -1, -1) if descending else range(250)
+    for index in indices:
+        db.insert_thought(Thought(id=f"note-{index:04d}", content="daily standup", embedding=_embedding()))
+    results = HybridSearch(db, deterministic_engine).search("standup", limit=3, mode=mode)
+    assert [result.thought.id for result in results] == ["note-0249", "note-0248", "note-0247"]

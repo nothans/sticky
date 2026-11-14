@@ -1,179 +1,116 @@
-"""Tests for the sticky configuration system."""
+"""Configuration supports only the small retained startup surface."""
 
-import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from sticky.core.config import StickyConfig, get_config
 
-
-def test_default_config():
-    config = StickyConfig()
-    assert config.embedding_model == "all-MiniLM-L6-v2"
-    assert config.embedding_dimensions == 384
-    assert config.confidence_threshold == 0.6
-    assert config.search_vector_weight == 0.6
-    assert config.search_fts_weight == 0.4
-    assert config.tui_default_view == "auto"
-    assert config.review_auto_resolve_days == 7
+RETAINED = {"data_dir", "openrouter_api_key", "openrouter_model", "default_search_limit", "default_list_limit"}
+REMOVED = {"embedding_model", "embedding_dimensions", "confidence_threshold", "search_mode",
+           "search_vector_weight", "search_fts_weight", "tui_default_view", "review_auto_resolve_days"}
 
 
-def test_default_config_additional_fields():
-    """Verify all remaining default values."""
-    config = StickyConfig()
-    assert config.openrouter_api_key == ""
-    assert config.openrouter_model == "anthropic/claude-sonnet-4.6"
-    assert config.digest_default_period == "day"
+def test_only_retained_fields_and_default_paths(tmp_data_dir):
+    config = StickyConfig(data_dir=tmp_data_dir)
+    assert set(StickyConfig.model_fields) == RETAINED
     assert config.default_search_limit == 10
     assert config.default_list_limit == 20
-    assert config.tui_show_filter_bar is False
-    assert config.tui_score_hint_shown is False
-    assert config.privacy_show_in_status is True
-    assert config.search_mode == "hybrid"
-
-
-def test_config_from_env(monkeypatch, tmp_data_dir):
-    monkeypatch.setenv("STICKY_CONFIDENCE_THRESHOLD", "0.5")
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
-    config = get_config(force_reload=True)
-    assert config.confidence_threshold == 0.5
-
-
-def test_config_data_dir_created(tmp_data_dir):
-    config = StickyConfig(data_dir=tmp_data_dir / "new_subdir")
-    config.ensure_dirs()
-    assert config.data_dir.exists()
-
-
-def test_config_db_path(tmp_data_dir):
-    config = StickyConfig(data_dir=tmp_data_dir)
+    assert config.openrouter_api_key == ""
     assert config.db_path == tmp_data_dir / "sticky.db"
-
-
-def test_config_toml_roundtrip(tmp_path):
-    config = StickyConfig(data_dir=tmp_path)
-    config_file = tmp_path / "config.toml"
-    config.save_to_file(config_file)
-    loaded = StickyConfig.load_from_file(config_file, data_dir=tmp_path)
-    assert loaded.confidence_threshold == config.confidence_threshold
-
-
-def test_config_set_value(tmp_data_dir):
-    config = StickyConfig(data_dir=tmp_data_dir)
-    prev = config.set("confidence_threshold", 0.5)
-    assert prev == 0.6
-    assert config.confidence_threshold == 0.5
-
-
-def test_config_default_data_dir():
-    """Verify platform-specific default data_dir."""
-    config = StickyConfig()
-    if sys.platform == "win32":
-        local_app_data = Path.home() / "AppData" / "Local" / "sticky"
-        assert config.data_dir == local_app_data
-    else:
-        assert config.data_dir == Path.home() / ".local" / "share" / "sticky"
-
-
-def test_config_config_dir_property():
-    """Verify config_dir is platform-specific."""
-    config = StickyConfig()
-    if sys.platform == "win32":
-        expected = Path.home() / "AppData" / "Local" / "sticky"
-    else:
-        expected = Path.home() / ".config" / "sticky"
-    assert config.config_dir == expected
-
-
-def test_config_config_file_property():
-    """Verify config_file points to config.toml inside config_dir."""
-    config = StickyConfig()
     assert config.config_file == config.config_dir / "config.toml"
 
 
-def test_config_ensure_dirs_creates_config_dir(tmp_path):
-    """ensure_dirs creates both data_dir and config_dir."""
-    config = StickyConfig(data_dir=tmp_path / "data_subdir")
+def test_config_directories(tmp_path):
+    config = StickyConfig(data_dir=tmp_path / "new-data")
     config.ensure_dirs()
-    assert config.data_dir.exists()
+    assert config.data_dir.is_dir()
+    assert config.config_dir.is_dir()
 
 
-def test_config_save_includes_api_key(tmp_path):
-    """save_to_file saves all keys including api_key (local file, same security as env var)."""
-    config = StickyConfig(data_dir=tmp_path, openrouter_api_key="secret-key-123")
-    config_file = tmp_path / "config.toml"
-    config.save_to_file(config_file)
-    content = config_file.read_text()
-    assert "secret-key-123" in content
+@pytest.mark.parametrize("key", sorted(REMOVED))
+def test_removed_fields_cannot_be_set(key):
+    config = StickyConfig(**{key: "obsolete"})
+    assert not hasattr(config, key)
+    with pytest.raises(ValueError, match="Unknown config key"):
+        config.set(key, "obsolete")
+    with pytest.raises(ValueError):
+        setattr(config, key, "obsolete")
 
 
-def test_config_to_display_dict(tmp_data_dir):
-    """to_display_dict should return source info and mask API keys."""
-    config = StickyConfig(data_dir=tmp_data_dir, openrouter_api_key="sk-1234567890")
-    display = config.to_display_dict()
-    # Each entry should have 'value' and 'source' keys
-    assert "embedding_model" in display
-    assert "value" in display["embedding_model"]
-    assert "source" in display["embedding_model"]
-    # API key should be masked
-    api_entry = display["openrouter_api_key"]
-    assert "sk-1234567890" not in str(api_entry["value"])
+def test_legacy_toml_and_environment_do_not_activate_settings(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.toml"
+    path.write_text('embedding_model = "unavailable-custom-model"\nembedding_dimensions = 768\n'
+                    'search_mode = "vector"\nconfidence_threshold = "broken"\n'
+                    'default_search_limit = 7\n', encoding="utf-8")
+    loaded = StickyConfig.load_from_file(path)
+    assert loaded.default_search_limit == 7
+    assert not REMOVED.intersection(loaded.model_dump())
+    loaded.save_to_file(loaded.config_file)
+    monkeypatch.setenv("STICKY_EMBEDDING_MODEL", "other-model")
+    monkeypatch.setenv("STICKY_CONFIDENCE_THRESHOLD", "broken")
+    active = get_config(force_reload=True)
+    assert active.default_search_limit == 7
+    assert not REMOVED.intersection(active.to_display_dict())
 
 
-def test_config_singleton(monkeypatch, tmp_data_dir):
-    """get_config returns the same instance unless force_reload."""
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
-    config1 = get_config(force_reload=True)
-    config2 = get_config()
-    assert config1 is config2
+@pytest.mark.parametrize("key", ["default_search_limit", "default_list_limit"])
+@pytest.mark.parametrize("value", [0, -1, "invalid", 1.5])
+def test_limit_validation_preserves_previous_value(key, value):
+    config = StickyConfig()
+    previous = getattr(config, key)
+    with pytest.raises(ValidationError):
+        config.set(key, value)
+    assert getattr(config, key) == previous
 
 
-def test_config_singleton_force_reload(monkeypatch, tmp_data_dir):
-    """get_config with force_reload returns a new instance."""
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
-    config1 = get_config(force_reload=True)
-    config2 = get_config(force_reload=True)
-    assert config1 is not config2
-
-
-def test_config_env_bool(monkeypatch, tmp_data_dir):
-    """Boolean env vars should be correctly parsed."""
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
-    monkeypatch.setenv("STICKY_TUI_SHOW_FILTER_BAR", "true")
-    config = get_config(force_reload=True)
-    assert config.tui_show_filter_bar is True
-
-
-def test_config_env_int(monkeypatch, tmp_data_dir):
-    """Integer env vars should be correctly parsed."""
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
-    monkeypatch.setenv("STICKY_DEFAULT_SEARCH_LIMIT", "25")
-    config = get_config(force_reload=True)
+def test_settings_validate_string_limit_and_path(tmp_path):
+    config = StickyConfig()
+    assert config.set("default_search_limit", "25") == 10
     assert config.default_search_limit == 25
+    config.set("data_dir", str(tmp_path))
+    assert config.data_dir == tmp_path
+    with pytest.raises(ValidationError):
+        config.openrouter_model = ""
 
 
-def test_config_toml_roundtrip_all_fields(tmp_path):
-    """Verify non-sensitive fields survive TOML roundtrip."""
-    config = StickyConfig(
-        data_dir=tmp_path,
-        confidence_threshold=0.75,
-        embedding_model="custom-model",
-        default_search_limit=50,
-        tui_show_filter_bar=True,
-    )
-    config_file = tmp_path / "config.toml"
-    config.save_to_file(config_file)
-    loaded = StickyConfig.load_from_file(config_file, data_dir=tmp_path)
-    assert loaded.confidence_threshold == 0.75
-    assert loaded.embedding_model == "custom-model"
-    assert loaded.default_search_limit == 50
-    assert loaded.tui_show_filter_bar is True
+def test_roundtrip_saves_only_retained_settings_and_local_key(tmp_path):
+    config = StickyConfig(data_dir=tmp_path, openrouter_api_key="dummy-secret", default_search_limit=23)
+    path = tmp_path / "config.toml"
+    config.save_to_file(path)
+    stored = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert set(stored) == RETAINED
+    assert stored["openrouter_api_key"] == "dummy-secret"
+    loaded = StickyConfig.load_from_file(path)
+    assert loaded.model_dump() == config.model_dump()
 
 
-def test_config_set_returns_previous(tmp_data_dir):
-    """set() returns the previous value."""
-    config = StickyConfig(data_dir=tmp_data_dir)
-    prev = config.set("embedding_model", "new-model")
-    assert prev == "all-MiniLM-L6-v2"
-    assert config.embedding_model == "new-model"
+@pytest.mark.parametrize("secret", ["abcd-dummy-secret", "tiny", ""])
+def test_secret_display_and_repr_reveal_no_prefix(secret):
+    config = StickyConfig(openrouter_api_key=secret)
+    display = config.to_display_dict()
+    assert display["openrouter_api_key"]["value"] == ("configured" if secret else "unset")
+    if secret:
+        assert secret not in repr(config)
+        assert secret[:4] not in str(display)
+
+
+def test_env_precedence_and_singleton(tmp_path, monkeypatch):
+    path = StickyConfig().config_file
+    StickyConfig(default_search_limit=7).save_to_file(path)
+    monkeypatch.setenv("STICKY_DEFAULT_SEARCH_LIMIT", "21")
+    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_path))
+    config = get_config(force_reload=True)
+    assert config.default_search_limit == 21
+    assert config.data_dir == tmp_path
+    assert config.to_display_dict()["default_search_limit"]["source"] == "env"
+    assert get_config() is config
+    assert get_config(force_reload=True) is not config
+
+
+def test_invalid_retained_env_fails_clearly(monkeypatch):
+    monkeypatch.setenv("STICKY_DEFAULT_LIST_LIMIT", "0")
+    with pytest.raises(ValidationError):
+        get_config(force_reload=True)

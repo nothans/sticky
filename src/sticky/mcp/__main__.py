@@ -1,5 +1,6 @@
-"""Allow running with python -m sticky.mcp.server."""
+"""Allow running with python -m sticky.mcp."""
 
-from sticky.mcp.server import mcp
+from sticky.mcp.server import run_server
 
-mcp.run()
+if __name__ == "__main__":
+    run_server()

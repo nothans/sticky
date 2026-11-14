@@ -9,10 +9,7 @@ from textual.widgets import Input
 
 
 class CaptureInput(Input):
-    """Capture input that handles Enter to capture thoughts.
-
-    Posts a CaptureSubmitted message when the user presses Enter.
-    """
+    """Enter submits the draft to the Home view for persistence."""
 
     DEFAULT_CSS = """
     CaptureInput {

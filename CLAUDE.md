@@ -1,96 +1,67 @@
-# Sticky — Personal Memory System
+# Sticky
 
-A local-first personal memory system. Capture thoughts with zero friction, let AI
-organize them, retrieve with semantic search, review with daily digests. Data stays
-on the user's machine; embeddings run locally; classification/digests use OpenRouter.
+A small personal memory tool: capture, find, edit/delete, recover. Python 3.11+;
+package `sticky-brain`, import `sticky`, command `sticky`. Alpha.
 
-Package: `sticky-brain` (PyPI name), import name `sticky`. Version 0.1.0. Python ≥3.11.
+## Development direction
 
-## Project State
+Err on the side of reducing complexity and features. Preserve the original note
+before enriching it. Avoid new integrations, dashboards, queues, settings, or
+derived memory systems without evidence from daily use.
 
-Shipped and working (v0.1.0, Alpha). All three interfaces are implemented and tested
-(343 tests). This is a real codebase now — not a design phase. If you touch behavior,
-update tests and the README together.
+Capture and editing are local, with best-effort fixed MiniLM 384-dimensional
+embeddings and keyword fallback. Each capture is a separate record; JSON restore
+is idempotent by ID. A changed note cannot keep the previous note's vector or
+classification. SQLite text/FTS/vector mutations are atomic.
+
+Automatic classification, entity/action features, review queues, resurfacing,
+synthesis, scheduling, and search/model selectors are removed from active
+interfaces. Legacy SQLite tables and stored history remain for recovery. Optional
+cloud digests require an explicit request and configured key. No startup cloud
+calls or automatic generation.
 
 ## Layout
 
-```
-src/sticky/
-  cli/app.py          # Typer + Rich CLI — all subcommands + `mcp-serve`, `tui`, `setup`
-  core/               # engine (interface-agnostic)
-    service.py        #   facade the CLI/MCP/TUI all call into
-    db.py             #   SQLite schema, sqlite-vec KNN + FTS5 keyword index
-    models.py         #   Pydantic v2 data models
-    embeddings.py     #   local sentence-transformers (all-MiniLM-L6-v2), lazy-loaded
-    classify.py       #   OpenRouter classification + entity extraction
-    entities.py       #   entity tracking / co-occurrence
-    search.py         #   hybrid search (0.6 vector + 0.4 FTS)
-    digest.py         #   daily digest, morning brief, entity synthesis
-    scheduler.py      #   scheduled digests
-    config.py         #   config precedence: env > config.toml > defaults
-  mcp/server.py       # FastMCP server — 19 tools, 5 resources, 4 prompts
-  mcp/__main__.py     # `python -m sticky.mcp` entry
-  tui/                # Textual TUI — 8 views (home, search, detail, review,
-                      #   entities, digest, stats, about) + widgets
-tests/                # 343 tests, pytest + pytest-asyncio (asyncio_mode=auto)
-config.example.toml   # copy to the OS config dir to configure
-```
+- `src/sticky/core/service.py`: shared facade for all interfaces.
+- `core/db.py`: SQLite schema, legacy storage, atomic text/FTS/vector mutations,
+  stable versioned timestamp/ID/direction cursors.
+- `core/search.py`, `embeddings.py`: fixed local hybrid retrieval and literal
+  keyword fallback. Apply filters before candidate limits.
+- `core/digest.py`: optional explicit cloud summaries.
+- `core/config.py`: five startup settings; environment > TOML > defaults.
+- `cli/app.py`: core note commands, local settings, optional digest, setup.
+- `mcp/server.py`: 13 tools, two resources, one research prompt; settings read-only.
+- `tui/`: Home, Search, About and note detail; retain drafts until writes succeed.
+- `tests/`: preservation/failure, retrieval, schemas, complete recovery, and Pilot.
 
-## Architecture
+## Commands
 
-`core/service.py` is the single facade; the CLI, MCP server, and TUI are thin
-presentation layers over it. Put business logic in `core/`, never in an interface
-layer. When adding a capability, wire it through the service so all three interfaces
-get it.
-
-Data flow: capture → local embedding (~100ms) → OpenRouter classification + entity
-extraction (~1s) → SQLite (`thoughts`, `entities`, `entity_mentions`, `action_items`,
-`digests`) with sqlite-vec KNN + FTS5 → hybrid search → digest/brief/synthesis on demand.
-
-Storage: single SQLite file. `%LOCALAPPDATA%\sticky\sticky.db` on Windows,
-`~/.local/share/sticky/sticky.db` on Linux/macOS.
-
-LLM: `anthropic/claude-sonnet-4.6` via OpenRouter (configurable). Works without an API
-key — capture and search still function; classification, entity extraction, and
-digests require one.
-
-## Tech Stack
-
-Python 3.11+ (uv) · SQLite + sqlite-vec + FTS5 · sentence-transformers (all-MiniLM-L6-v2)
-· OpenRouter · Typer + Rich (CLI) · Textual (TUI) · FastMCP (MCP) · Pydantic v2 · httpx.
-
-## Common Commands
-
-```bash
-uv sync --dev                      # install with dev deps
-uv run pytest                      # run all 343 tests
-uv run pytest tests/test_search.py -v
-uv run pytest --cov=sticky
-uv run sticky setup                # create data dir, print MCP config
-uv run sticky add "a thought"      # capture
-uv run sticky mcp-serve            # start MCP server (same as `python -m sticky.mcp`)
-uv run sticky tui                  # terminal UI
+```powershell
+uv sync --locked --extra dev
+uv run --locked --extra dev pytest
+uv run sticky setup
+uv run sticky add "a thought"
+uv run sticky search "a thought"
+uv run sticky tui
+uv run sticky mcp-serve
 ```
 
-## MCP Server
-
-Exposes 19 tools, 5 resources, 4 prompts (see README for the full list). Configured in
-the user's Claude config as `python -m sticky.mcp` (stdio, 30s timeout). The heavy deps
-(torch/transformers) are lazy-loaded, so cold import is ~1s — well under the timeout.
-When adding an MCP tool, back it with a `service.py` method rather than duplicating logic.
+Default database: `%LOCALAPPDATA%\sticky\sticky.db` on Windows,
+`~/.local/share/sticky/sticky.db` elsewhere. `STICKY_DATA_DIR` overrides it.
+Tests must isolate data and configuration and mock optional HTTP calls.
+The tracked `uv.lock` defines the tested development/CI environment. Keep Python
+3.11 compatibility when refreshing it. MCP uses the v2 SDK; async protocol
+handlers keep the shared SQLite service on its event-loop thread. Read-only and
+write annotations and structured results describe the existing small surface.
 
 ## Conventions
 
-- All logic lives in `core/`; interfaces stay thin.
-- Every CLI command supports `--json` for scripting — preserve that when editing commands.
-- Keep the README's command/tool lists in sync with the code (three interfaces + tool count).
-- Add tests for new behavior; match existing test-file naming (`tests/test_<module>.py`).
-
-## Commit Style
-- lowercase first letter
-- short, direct descriptions (no fluff)
-- use a line for each change
-- no conventional commit prefixes (no "feat:", "fix:", etc.)
-- imperative/present tense ("fix X", "update Y", "remove Z")
-- no trailing period
-- no Co-Authored-By lines
+- Business logic belongs in the core service; interfaces remain thin.
+- Update tests and README when behavior changes. Keep command/tool lists accurate.
+- Mask API keys in reads, writes, errors, and setup receipts.
+- Local configuration writes validate retained fields and apply next session.
+- JSON restores thought records; SQLite backup is complete database recovery.
+  Use the executable README procedure; preserve legacy history.
+- Internal working context lives in ignored `.meta/`.
+- Commit messages: lowercase, short, imperative, no prefix or co-author trailers.
+  Commit or push only when requested.

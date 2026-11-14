@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import os
 import struct
-from functools import lru_cache
 
 import numpy as np
 
@@ -11,15 +11,19 @@ import numpy as np
 class EmbeddingEngine:
     """Manages sentence-transformer model for embedding generation."""
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        self.model_name = model_name
+    def __init__(self):
+        self.model_name = "all-MiniLM-L6-v2"
         self._model = None
 
     @property
     def model(self):
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self.model_name)
+            offline = any(
+                os.getenv(name, "").strip().upper() in {"1", "ON", "YES", "TRUE"}
+                for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+            )
+            self._model = SentenceTransformer(self.model_name, local_files_only=offline)
         return self._model
 
     @property
@@ -59,9 +63,9 @@ class EmbeddingEngine:
 _engine: EmbeddingEngine | None = None
 
 
-def get_embedding_engine(model_name: str = "all-MiniLM-L6-v2") -> EmbeddingEngine:
+def get_embedding_engine() -> EmbeddingEngine:
     """Get or create the global embedding engine singleton."""
     global _engine
-    if _engine is None or _engine.model_name != model_name:
-        _engine = EmbeddingEngine(model_name)
+    if _engine is None:
+        _engine = EmbeddingEngine()
     return _engine

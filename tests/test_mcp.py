@@ -1,331 +1,387 @@
-"""Tests for the MCP server tool functions."""
+"""MCP schemas and retained operations use isolated local storage."""
 
+import asyncio
+import inspect
+import json
+import os
+from pathlib import Path
+import struct
+import sys
+import threading
+
+import httpx
 import pytest
+from mcp import Client, StdioServerParameters
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult
 
-from sticky.mcp.server import (
-    get_service,
-    sticky_actions,
-    sticky_capture,
-    sticky_classify,
-    sticky_config,
-    sticky_delete,
-    sticky_digest,
-    sticky_entities,
-    sticky_export,
-    sticky_import,
-    sticky_list,
-    sticky_privacy,
-    sticky_related,
-    sticky_review,
-    sticky_search,
-    sticky_stats,
-    sticky_update,
-)
+from sticky.mcp import server
 
 
 @pytest.fixture(autouse=True)
-def reset_service(tmp_data_dir, monkeypatch):
-    """Reset the module-level service singleton between tests."""
-    import sticky.mcp.server as mod
-
-    monkeypatch.setenv("STICKY_DATA_DIR", str(tmp_data_dir))
-    mod._service = None
+def local_service(monkeypatch):
+    from sticky.core.embeddings import EmbeddingEngine
+    monkeypatch.setattr(EmbeddingEngine, "embed", lambda self, text: struct.pack("384f", *([1.0] + [0.0] * 383)))
+    monkeypatch.setattr(server, "_service", None)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No cloud request expected")
+    monkeypatch.setattr(httpx.Client, "post", forbidden)
+    monkeypatch.setattr(httpx.AsyncClient, "post", forbidden)
     yield
-    mod._service = None
-
-
-class TestGetService:
-    """Tests for the service singleton."""
-
-    def test_get_service_returns_initialized_service(self):
-        svc = get_service()
-        assert svc is not None
-        assert svc.search_engine is not None
-
-    def test_get_service_returns_same_instance(self):
-        svc1 = get_service()
-        svc2 = get_service()
-        assert svc1 is svc2
-
-
-class TestStickyCapture:
-    """Tests for sticky_capture tool."""
-
-    def test_capture_returns_dict(self):
-        result = sticky_capture("test thought")
-        assert isinstance(result, dict)
-        assert "id" in result
-        assert result["content"] == "test thought"
-
-    def test_capture_with_template(self):
-        result = sticky_capture("meeting notes", template="meeting")
-        assert "id" in result
-        assert result["content"] == "meeting notes"
-
-    def test_capture_has_required_fields(self):
-        result = sticky_capture("my important idea")
-        for key in ("id", "content", "category", "confidence", "needs_review",
-                     "entities", "created_at"):
-            assert key in result, f"Missing key: {key}"
-
-
-class TestStickySearch:
-    """Tests for sticky_search tool."""
-
-    def test_search_returns_results_structure(self):
-        sticky_capture("hello world from sticky")
-        result = sticky_search("hello")
-        assert "results" in result
-        assert "query" in result
-        assert "total_results" in result
-        assert result["query"] == "hello"
-
-    def test_search_empty_results(self):
-        result = sticky_search("nonexistent content xyz")
-        assert result["total_results"] == 0
-        assert result["results"] == []
-
-    def test_search_with_limit(self):
-        for i in range(5):
-            sticky_capture(f"programming concept number {i}")
-        result = sticky_search("programming", limit=2)
-        assert len(result["results"]) <= 2
-
-
-class TestStickyList:
-    """Tests for sticky_list tool."""
-
-    def test_list_returns_pagination(self):
-        sticky_capture("thought 1")
-        sticky_capture("thought 2")
-        result = sticky_list(limit=1)
-        assert "thoughts" in result
-        assert "total" in result
-        assert "has_more" in result
-        assert result["has_more"] is True
-
-    def test_list_defaults(self):
-        result = sticky_list()
-        assert "thoughts" in result
-        assert "total" in result
-
-
-class TestStickyReview:
-    """Tests for sticky_review tool."""
-
-    def test_review_returns_items(self):
-        # With test API key, classification fails -> needs_review=True
-        sticky_capture("review this thought")
-        result = sticky_review()
-        assert "items" in result
-        assert "total" in result
-        assert result["total"] >= 1
-
-
-class TestStickyClassify:
-    """Tests for sticky_classify tool."""
-
-    def test_classify_updates_category(self):
-        captured = sticky_capture("classify me")
-        result = sticky_classify(captured["id"], "idea")
-        assert result["category"] == "idea"
-        assert result["confidence"] == 1.0
-        assert result["needs_review"] is False
-
-    def test_classify_nonexistent_raises(self):
-        with pytest.raises(ValueError, match="not found"):
-            sticky_classify("nonexistent-id", "idea")
-
-
-class TestStickyEntities:
-    """Tests for sticky_entities tool."""
-
-    def test_entities_returns_structure(self):
-        result = sticky_entities()
-        assert "entities" in result
-        assert "total" in result
-
-
-class TestStickyDigest:
-    """Tests for sticky_digest tool."""
-
-    def test_digest_returns_structure(self):
-        sticky_capture("something to digest")
-        result = sticky_digest()
-        assert "digest" in result
-        assert "period" in result
-        assert "thought_count" in result
-        assert "digest_id" in result
-
-
-class TestStickyUpdate:
-    """Tests for sticky_update tool."""
-
-    def test_update_changes_content(self):
-        captured = sticky_capture("original content")
-        result = sticky_update(captured["id"], "updated content")
-        assert result["content"] == "updated content"
-
-    def test_update_nonexistent_raises(self):
-        with pytest.raises(ValueError, match="not found"):
-            sticky_update("nonexistent-id", "new content")
-
-
-class TestStickyDelete:
-    """Tests for sticky_delete tool."""
-
-    def test_delete_removes_thought(self):
-        captured = sticky_capture("delete me")
-        result = sticky_delete(captured["id"])
-        assert result["deleted"] is True
-        assert result["id"] == captured["id"]
-
-        listing = sticky_list()
-        assert listing["total"] == 0
-
-    def test_delete_nonexistent_raises(self):
-        with pytest.raises(ValueError, match="not found"):
-            sticky_delete("nonexistent-id")
-
-
-class TestStickyStats:
-    """Tests for sticky_stats tool."""
-
-    def test_stats_returns_system_info(self):
-        result = sticky_stats()
-        assert "system" in result
-        assert "db_path" in result["system"]
-
-    def test_stats_counts_thoughts(self):
-        sticky_capture("stat this")
-        result = sticky_stats()
-        assert result["thoughts"]["total"] == 1
-
-
-class TestStickyConfig:
-    """Tests for sticky_config tool."""
-
-    def test_config_get_all(self):
-        result = sticky_config(action="get")
-        assert isinstance(result, dict)
-        assert len(result) > 0
-
-    def test_config_get_key(self):
-        result = sticky_config(action="get", key="confidence_threshold")
-        # Should return the specific key's value+source dict
-        assert isinstance(result, dict)
-
-    def test_config_get_unknown_key(self):
-        result = sticky_config(action="get", key="nonexistent_key")
-        assert "error" in result
-
-    def test_config_set(self):
-        result = sticky_config(action="set", key="confidence_threshold",
-                               value="0.8")
-        assert "key" in result
-        assert "previous" in result
-        assert "new" in result
-
-
-class TestStickyRelated:
-    """Tests for sticky_related tool."""
-
-    def test_related_returns_list(self):
-        r1 = sticky_capture("python programming language")
-        sticky_capture("javascript web development")
-        result = sticky_related(r1["id"])
-        assert isinstance(result, list)
-
-    def test_related_nonexistent_returns_empty(self):
-        result = sticky_related("nonexistent-id")
-        assert result == []
-
-
-class TestStickyPrivacy:
-    """Tests for sticky_privacy tool."""
-
-    def test_privacy_shows_data_flow(self):
-        result = sticky_privacy()
-        assert "data_flow" in result
-        assert result["data_flow"]["embeddings"] == "LOCAL"
-        assert result["data_flow"]["storage"] == "LOCAL"
-
-    def test_privacy_shows_paths(self):
-        result = sticky_privacy()
-        assert "data_dir" in result
-        assert "db_path" in result
-
-
-class TestStickyExport:
-    """Tests for sticky_export tool."""
-
-    def test_export_json(self, tmp_path):
-        sticky_capture("export me")
-        output = str(tmp_path / "export.json")
-        result = sticky_export(format="json", output_path=output)
-        assert result["format"] == "json"
-        assert result["count"] == 1
-
-    def test_export_markdown(self, tmp_path):
-        sticky_capture("export as markdown")
-        output = str(tmp_path / "md_export")
-        result = sticky_export(format="markdown", output_path=output)
-        assert result["format"] == "markdown"
-        assert result["count"] == 1
-
-
-class TestStickyImport:
-    """Tests for sticky_import tool."""
-
-    def test_import_json_dry_run(self, tmp_path):
-        # Create a simple JSON file to import
-        import json
-
-        data = {
-            "exported_at": "2025-01-01T00:00:00Z",
-            "version": "1.0",
-            "thoughts": [
-                {"id": "new-thought-1", "content": "imported thought"}
-            ],
-            "entities": [],
-        }
-        source = tmp_path / "import.json"
-        source.write_text(json.dumps(data))
-
-        result = sticky_import(source_path=str(source), dry_run=True)
-        assert result["imported"] == 1
-        assert result["dry_run"] is True
-
-
-class TestStickyActions:
-    """Tests for sticky_actions tool."""
-
-    def test_actions_list(self):
-        result = sticky_actions()
-        assert "actions" in result
-        assert "total" in result
-
-    def test_actions_complete_nonexistent(self):
-        with pytest.raises(ValueError, match="not found"):
-            sticky_actions(action="complete", action_id="nonexistent-id")
-
-    def test_actions_complete(self):
-        from sticky.core.models import ActionItem
-
-        svc = get_service()
-        action = ActionItem(content="Test action", source_thought_id=None)
-        svc.db.insert_action_item(action)
-
-        result = sticky_actions(action="complete", action_id=action.id)
-        assert result["completed"] is True
-
-
-class TestAllToolsRegistered:
-    """Verify all 16 tools are registered with the MCP server."""
-
-    def test_all_tools_registered(self):
-        from sticky.mcp.server import mcp
-
-        # FastMCP stores tools internally; verify the server object exists
-        assert mcp is not None
-        assert mcp.name == "sticky"
+    if server._service is not None:
+        server._service.db.close()
+    server._service = None
+
+
+@pytest.mark.asyncio
+async def test_registered_schema_has_only_retained_tools():
+    tools = {tool.name: tool for tool in await server.mcp.list_tools()}
+    assert set(tools) == {
+        "sticky_capture", "sticky_search", "sticky_list", "sticky_get", "sticky_classify",
+        "sticky_update", "sticky_delete", "sticky_export", "sticky_import", "sticky_digest",
+        "sticky_stats", "sticky_config", "sticky_privacy",
+    }
+    assert set(tools["sticky_config"].input_schema["properties"]) == {"key"}
+    for name in ("sticky_search", "sticky_list", "sticky_export"):
+        assert not {"entity", "needs_review", "mode"}.intersection(tools[name].input_schema["properties"])
+    assert "template" not in tools["sticky_capture"].input_schema["properties"]
+    assert all(tool.output_schema["type"] == "object" for tool in tools.values())
+    assert all(tool.annotations.open_world_hint is False for name, tool in tools.items() if name != "sticky_digest")
+    assert tools["sticky_digest"].annotations.open_world_hint is True
+    assert tools["sticky_config"].annotations.read_only_hint is True
+    assert tools["sticky_capture"].annotations.destructive_hint is False
+    assert tools["sticky_capture"].annotations.idempotent_hint is False
+    assert tools["sticky_delete"].annotations.destructive_hint is True
+    assert tools["sticky_update"].annotations.idempotent_hint is False
+    assert tools["sticky_export"].annotations.read_only_hint is False
+    assert "OpenRouter" in tools["sticky_digest"].description
+    assert "send" in tools["sticky_digest"].description.lower()
+    resources = await server.mcp.list_resources()
+    assert {str(resource.uri) for resource in resources} == {"sticky://stats", "sticky://privacy"}
+    assert {prompt.name for prompt in await server.mcp.list_prompts()} == {"research_session"}
+    prompt = await server.research_session("local research", "paper")
+    assert "sticky_synthesize" not in prompt
+    assert "sticky_list" in prompt
+
+
+async def test_capture_get_edit_and_manual_category_without_network():
+    first = await server.sticky_capture("Call Monday", source_url="https://example.org", thread="work")
+    second = await server.sticky_capture("Call Tuesday")
+    repeat = await server.sticky_capture("Call Monday")
+    assert len({first["id"], second["id"], repeat["id"]}) == 3
+    assert first["category"] is None
+    assert "entities" not in first
+    assert (await server.sticky_get(first["id"]))["source_url"] == "https://example.org"
+    assert (await server.sticky_classify(first["id"], "action"))["category"] == "action"
+    updated = await server.sticky_update(first["id"], "Call Wednesday")
+    assert updated["metadata"]["thread"] == "work"
+    assert updated["category"] is None
+    assert (await server.sticky_delete(first["id"]))["deleted"]
+    with pytest.raises(ToolError, match="not found"):
+        await server.sticky_get(first["id"])
+
+
+async def test_search_and_filtered_paginated_list():
+    first = await server.sticky_capture("quantum research", thread="physics")
+    await server.sticky_classify(first["id"], "reference")
+    await server.sticky_capture("quantum theory")
+    results = await server.sticky_search("quantum", category="reference", limit=1)
+    assert results["total_results"] == 1
+    assert results["results"][0]["id"] == first["id"]
+    listing = await server.sticky_list(limit=1)
+    assert listing["has_more"]
+    next_page = await server.sticky_list(limit=1, cursor=listing["next_cursor"])
+    assert not next_page["has_more"]
+    assert next_page["thoughts"][0]["id"] != listing["thoughts"][0]["id"]
+    assert (await server.sticky_list(thread="physics"))["total"] == 1
+
+
+async def test_config_read_only_and_secret_masked():
+    assert list(inspect.signature(server.sticky_config).parameters) == ["key"]
+    server.get_service().config.openrouter_api_key = "dummy-private-value"
+    display = await server.sticky_config()
+    assert display["openrouter_api_key"]["value"] == "configured"
+    assert "dummy" not in str(display)
+    with pytest.raises(ToolError, match="Unknown config key"):
+        await server.sticky_config("embedding_model")
+    with pytest.raises(TypeError):
+        await server.sticky_config(action="set", value="broken")
+
+
+async def test_export_and_restore(tmp_path):
+    thought = await server.sticky_capture("JSON recovery")
+    target = str(tmp_path / "export.json")
+    assert (await server.sticky_export("json", target))["count"] == 1
+    assert (await server.sticky_import(target, dry_run=True))["skipped"] == 1
+    await server.sticky_delete(thought["id"])
+    assert (await server.sticky_import(target))["imported"] == 1
+    assert (await server.sticky_get(thought["id"]))["content"] == "JSON recovery"
+
+
+async def test_explicit_digest_missing_key_and_mocked_request(monkeypatch):
+    await server.sticky_capture("summarize this note")
+    svc = server.get_service()
+    svc.config.openrouter_api_key = ""
+    with pytest.raises(ToolError, match="API key"):
+        await server.sticky_digest()
+    svc.config.openrouter_api_key = "dummy-key"
+    monkeypatch.setattr(svc.digest_generator, "generate_sync", lambda thoughts: {"text": "Summary [1]."})
+    result = await server.sticky_digest()
+    assert result["thought_count"] == 1
+    assert len(result["thought_ids"]) == 1
+    assert not {"action_items", "resurfaced", "sources"}.intersection(result)
+
+
+async def test_stats_privacy_and_singleton():
+    assert server.get_service() is server.get_service()
+    await server.sticky_capture("count this")
+    assert (await server.sticky_stats())["thoughts"]["total"] == 1
+    assert (await server.sticky_privacy())["data_flow"]["capture"] == "LOCAL"
+
+
+async def test_failed_initialization_can_retry(monkeypatch):
+    original = server.StickyService.initialize
+    attempts = 0
+
+    def initialize(service):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("Temporary storage failure")
+        original(service)
+
+    monkeypatch.setattr(server.StickyService, "initialize", initialize)
+    with pytest.raises(OSError, match="Temporary storage failure"):
+        await server.sticky_stats()
+    assert server._service is None
+    assert (await server.sticky_stats())["thoughts"]["total"] == 0
+    assert attempts == 2
+
+
+def test_package_entrypoint_uses_shared_startup(monkeypatch):
+    import runpy
+
+    started = []
+    monkeypatch.setattr(server, "run_server", lambda: started.append(True))
+    monkeypatch.setattr(server.mcp, "run", lambda **kwargs: pytest.fail("Bypassed shared startup"))
+    runpy.run_module("sticky.mcp", run_name="__main__")
+    assert started == [True]
+
+
+@pytest.mark.parametrize("operation", [lambda: server.sticky_capture(" "),
+    lambda: server.sticky_search("query", limit=0), lambda: server.sticky_list(limit=-1),
+    lambda: server.sticky_update("missing", "new text"), lambda: server.sticky_delete("missing")])
+async def test_invalid_calls_fail(operation):
+    with pytest.raises(ToolError):
+        await operation()
+
+
+def _payload(result):
+    assert isinstance(result, CallToolResult)
+    assert not result.is_error, result
+    assert isinstance(result.structured_content, dict)
+    assert json.loads(result.content[0].text) == result.structured_content
+    return result.structured_content
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_concurrent_protocol_operations_keep_sqlite_on_event_loop(monkeypatch, mode):
+    loop_thread = threading.get_ident()
+    initialized_on = []
+    original = server.StickyService.initialize
+
+    def initialize(service):
+        initialized_on.append(threading.get_ident())
+        original(service)
+
+    monkeypatch.setattr(server.StickyService, "initialize", initialize)
+    async with Client(server.mcp, mode=mode) as client:
+        saved = await asyncio.gather(*[
+            client.call_tool("sticky_capture", {"content": f"Concurrent research note {i}", "thread": "parallel"})
+            for i in range(8)
+        ])
+        ids = [_payload(result)["id"] for result in saved]
+        assert len(set(ids)) == 8
+        stats, listing, resource, privacy, prompt = await asyncio.gather(
+            client.call_tool("sticky_stats", {}),
+            client.call_tool("sticky_list", {"thread": "parallel", "limit": 3}),
+            client.read_resource("sticky://stats"),
+            client.read_resource("sticky://privacy"),
+            client.get_prompt("research_session", {"topic": "Parallel research", "source": "paper"}),
+        )
+        assert _payload(stats)["thoughts"]["total"] == 8
+        assert _payload(listing)["total"] == 8
+        assert _payload(listing)["has_more"]
+        assert json.loads(resource.contents[0].text)["thoughts"]["total"] == 8
+        assert json.loads(privacy.contents[0].text)["data_flow"]["capture"] == "LOCAL"
+        assert "sticky_list" in prompt.messages[0].content.text
+        changed = await asyncio.gather(*[
+            client.call_tool("sticky_update", {"thought_id": thought_id, "content": f"Revised research note {i}"})
+            for i, thought_id in enumerate(ids)
+        ])
+        assert all(_payload(result)["content"].startswith("Revised") for result in changed)
+        read = await asyncio.gather(*[
+            client.call_tool("sticky_get", {"thought_id": thought_id}) for thought_id in ids
+        ])
+        assert all(_payload(result)["metadata"]["thread"] == "parallel" for result in read)
+        deleted = await asyncio.gather(*[
+            client.call_tool("sticky_delete", {"thought_id": thought_id}) for thought_id in ids
+        ])
+        assert all(_payload(result)["deleted"] for result in deleted)
+        assert _payload(await client.call_tool("sticky_stats", {}))["thoughts"]["total"] == 0
+    assert initialized_on == [loop_thread]
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_protocol_errors_are_useful_and_session_can_recover(tmp_path, monkeypatch, mode):
+    async with Client(server.mcp, mode=mode) as client:
+        for name, arguments, message in [
+            ("sticky_capture", {"content": " "}, "contain text"),
+            ("sticky_get", {"thought_id": "missing"}, "not found"),
+            ("sticky_search", {"query": "valid", "limit": 0}, "positive integer"),
+            ("sticky_config", {"key": "embedding_model"}, "Unknown config key"),
+            ("sticky_import", {"source_path": str(tmp_path / "missing.json")}, "missing.json"),
+        ]:
+            result = await client.call_tool(name, arguments)
+            assert result.is_error, result
+            assert result.structured_content is None
+            assert message in result.content[0].text
+        invalid_type = await client.call_tool("sticky_capture", {"content": ["invalid"]})
+        assert invalid_type.is_error
+        svc = server.get_service()
+        svc.config.openrouter_api_key = ""
+        missing_key = await client.call_tool("sticky_digest", {})
+        assert missing_key.is_error and "API key" in missing_key.content[0].text
+        note = _payload(await client.call_tool("sticky_capture", {"content": "Recovered session"}))
+        classified = _payload(await client.call_tool("sticky_classify", {"thought_id": note["id"], "category": "reference"}))
+        assert classified["category"] == "reference"
+        path = str(tmp_path / "recovery.json")
+        assert _payload(await client.call_tool("sticky_export", {"format": "json", "output_path": path}))["count"] == 1
+        assert _payload(await client.call_tool("sticky_import", {"source_path": path, "dry_run": True}))["skipped"] == 1
+        _payload(await client.call_tool("sticky_delete", {"thought_id": note["id"]}))
+        assert _payload(await client.call_tool("sticky_import", {"source_path": path}))["imported"] == 1
+        svc.config.openrouter_api_key = "dummy-key"
+        monkeypatch.setattr(svc.digest_generator, "generate_sync", lambda thoughts: {"text": "Summary [1]."})
+        digest = _payload(await client.call_tool("sticky_digest", {}))
+        assert digest["thought_ids"] == [note["id"]]
+        assert _payload(await client.call_tool("sticky_privacy", {}))["data_flow"]["digest"] == "CLOUD_ON_REQUEST"
+
+        def broken_search(*args, **kwargs):
+            raise RuntimeError("unexpected failure containing a private secret")
+
+        monkeypatch.setattr(svc, "search", broken_search)
+        crashed = await client.call_tool("sticky_search", {"query": "valid"})
+        assert crashed.is_error
+        assert "private secret" not in str(crashed)
+        assert _payload(await client.call_tool("sticky_get", {"thought_id": note["id"]}))["content"] == "Recovered session"
+
+
+@pytest.mark.parametrize("preload_fails", [False, True])
+def test_startup_preloads_libraries_without_loading_weights(monkeypatch, preload_fails):
+    events = []
+
+    def preload(name):
+        assert name == "sentence_transformers"
+        events.append("libraries")
+        if preload_fails:
+            raise ImportError("unavailable")
+
+    def run(**kwargs):
+        assert kwargs == {"transport": "stdio"}
+        assert server._service is None
+        events.append("stdio")
+
+    monkeypatch.setattr(server.importlib, "import_module", preload)
+    monkeypatch.setattr(server.mcp, "run", run)
+    server.run_server()
+    assert events == ["libraries", "stdio"]
+
+
+def test_server_shutdown_closes_service_even_if_transport_fails(monkeypatch):
+    service = server.get_service()
+    closed = []
+    original_close = service.db.close
+
+    def close():
+        closed.append(True)
+        original_close()
+
+    def fail(**kwargs):
+        raise RuntimeError("transport stopped")
+
+    monkeypatch.setattr(service.db, "close", close)
+    monkeypatch.setattr(server.importlib, "import_module", lambda name: None)
+    monkeypatch.setattr(server.mcp, "run", fail)
+    with pytest.raises(RuntimeError, match="transport stopped"):
+        server.run_server()
+    assert closed == [True]
+    assert server._service is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [
+    ["-m", "sticky.mcp.server"],
+    ["-m", "sticky.mcp"],
+    ["-m", "sticky.cli.app", "mcp-serve"],
+])
+async def test_real_stdio_capture_and_search_after_config(tmp_path, arguments):
+    """Real stdio requests must load local vectors and retrieve beyond keywords."""
+    guard = tmp_path / "guard"
+    guard.mkdir()
+    guard.joinpath("sitecustomize.py").write_text(
+        "import os, traceback, httpx, httpx2\n"
+        "def forbidden(*args, **kwargs):\n"
+        "    with open(os.environ['QA_HTTP_LOG'], 'a') as log:\n"
+        "        request = args[1]\n"
+        "        log.write(f'{request.method} {request.url}\\n' + ''.join(traceback.format_stack(limit=8)))\n"
+        "    raise AssertionError('Local MCP operations must not call the cloud')\n"
+        "async def async_forbidden(*args, **kwargs): return forbidden(*args, **kwargs)\n"
+        "for library in (httpx, httpx2):\n"
+        "    library.HTTPTransport.handle_request = forbidden\n"
+        "    library.AsyncHTTPTransport.handle_async_request = async_forbidden\n",
+        encoding="utf-8",
+    )
+    env = {key: value for key, value in os.environ.items() if not key.startswith("STICKY_")}
+    env.setdefault("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+    env.update({
+        "STICKY_DATA_DIR": str(tmp_path / "data"), "USERPROFILE": str(tmp_path / "home"),
+        "HOME": str(tmp_path / "home"), "XDG_CONFIG_HOME": str(tmp_path / "home" / ".config"),
+        "STICKY_OPENROUTER_API_KEY": "dummy-protocol-test",
+        "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "TOKENIZERS_PARALLELISM": "false",
+        "PYTHONPATH": str(guard) + os.pathsep + str(Path(__file__).resolve().parents[1] / "src"),
+        "QA_HTTP_LOG": str(tmp_path / "cloud-attempts.log"),
+    })
+    parameters = StdioServerParameters(command=sys.executable, args=arguments, env=env)
+    async with Client(parameters, read_timeout_seconds=60.0) as client:
+        listed = await client.list_tools()
+        assert len(listed.tools) == 13
+        assert {resource.uri for resource in (await client.list_resources()).resources} == {"sticky://stats", "sticky://privacy"}
+        assert {prompt.name for prompt in (await client.list_prompts()).prompts} == {"research_session"}
+        config = await client.call_tool("sticky_config", {})
+        assert "dummy-protocol-test" not in str(config)
+        _payload(config)
+        saved = await client.call_tool("sticky_capture", {
+            "content": "Protocol note about passport renewal", "thread": "protocol-test",
+        })
+        note = _payload(saved)
+        assert note["embedding_model"] == "all-MiniLM-L6-v2"
+        found, semantic, recovered, resource = await asyncio.gather(
+            client.call_tool("sticky_search", {"query": "passport renewal", "limit": 3}),
+            client.call_tool("sticky_search", {"query": "travel document expiry", "limit": 3}),
+            client.call_tool("sticky_get", {"thought_id": note["id"]}),
+            client.read_resource("sticky://stats"),
+        )
+        assert any(result["id"] == note["id"] for result in _payload(found)["results"])
+        assert any(
+            result["id"] == note["id"] and result["match_type"] == "vector"
+            for result in _payload(semantic)["results"]
+        )
+        record = _payload(recovered)
+        assert record["content"] == "Protocol note about passport renewal"
+        assert record["embedding_model"] == "all-MiniLM-L6-v2"
+        assert record["metadata"]["thread"] == "protocol-test"
+        assert json.loads(resource.contents[0].text)["thoughts"]["total"] == 1
+        rejected = await client.call_tool("sticky_get", {"thought_id": "missing"})
+        assert rejected.is_error and "not found" in rejected.content[0].text
+        assert _payload(await client.call_tool("sticky_get", {"thought_id": note["id"]}))["id"] == note["id"]
+    assert not (tmp_path / "cloud-attempts.log").exists()
