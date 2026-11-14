@@ -19,6 +19,22 @@ from sticky.core.models import (
 )
 
 
+def _has_vec():
+    try:
+        conn = sqlite3.connect(":memory:")
+        conn.enable_load_extension(True)
+        import sqlite_vec
+        sqlite_vec.load(conn)
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+_VEC_AVAILABLE = _has_vec()
+requires_vec = pytest.mark.skipif(not _VEC_AVAILABLE, reason="sqlite-vec not available")
+
+
 @pytest.fixture
 def db(tmp_data_dir):
     """Provide an initialized Database instance for tests."""
@@ -77,6 +93,7 @@ def test_initialize_idempotent(db):
     db.initialize()
 
 
+@requires_vec
 def test_vector_availability_is_per_connection(tmp_data_dir, monkeypatch):
     import sqlite_vec
 
@@ -106,6 +123,7 @@ def test_vector_availability_is_per_connection(tmp_data_dir, monkeypatch):
         indexed.close()
 
 
+@requires_vec
 def test_vector_index_recovers_edits_and_deletes_during_outage(tmp_data_dir, monkeypatch):
     import sqlite_vec
 
@@ -136,6 +154,7 @@ def test_vector_index_recovers_edits_and_deletes_during_outage(tmp_data_dir, mon
         database.close()
 
 
+@requires_vec
 def test_failed_vector_rebuild_retains_previous_index(db):
     original = _make_thought(embedding=DUMMY_EMBEDDING)
     db.insert_thought(original)
@@ -815,20 +834,6 @@ def test_stats_empty_db(db):
 # ---------------------------------------------------------------------------
 
 
-def _has_vec():
-    try:
-        import sqlite3
-        conn = sqlite3.connect(":memory:")
-        conn.enable_load_extension(True)
-        import sqlite_vec
-        sqlite_vec.load(conn)
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-_VEC_AVAILABLE = _has_vec()
-requires_vec = pytest.mark.skipif(not _VEC_AVAILABLE, reason="sqlite-vec not available")
 
 
 @requires_vec
